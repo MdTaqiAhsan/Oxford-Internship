@@ -1,6 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
 
 class CellSimulation:
     def __init__(self, num_immune=10, num_cancer=15, width=100, height=100, timesteps=100, mode='killing'):
@@ -96,41 +94,28 @@ class CellSimulation:
 # ==========================================
 # EXECUTION & ANIMATION VISUALIZATION
 # ==========================================
-if __name__ == "__main__":
-    # Change mode to 'non-killing' to simulate Type B behavior
-    sim_mode = 'killing' 
-    timesteps = 120
-    
-    sim = CellSimulation(num_immune=8, num_cancer=12, timesteps=timesteps, mode=sim_mode)
+import os
+
+def generate_dataset(mode, run_id):
+    """Helper function to run a single simulation and save it with a unique ID inside a folder."""
+    # Create the folder if it doesn't exist yet
+    output_dir = "simulation_data"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        
+    sim = CellSimulation(num_immune=8, num_cancer=12, timesteps=120, mode=mode)
     trajectories = sim.run_simulation()
     
-    # Save data for your next CHNN step!
-    np.save(f"cell_trajectories_{sim_mode}.npy", trajectories)
-    print(f"Simulation complete! Array saved with shape: {trajectories.shape}")
+    # Save with unique identifier inside the folder
+    filename = os.path.join(output_dir, f"data_{mode}_{run_id}.npy")
+    np.save(filename, trajectories)
 
-    # Set up matplotlib animation for validation
-    fig, ax = plt.subplots(figsize=(7, 7))
-    ax.set_xlim(0, 100)
-    ax.set_ylim(0, 100)
-    ax.set_title(f"Cell Dynamics Simulation: Mode = {sim_mode.upper()}")
-    
-    immune_scatter = ax.scatter([], [], c='blue', label='Immune Cells (T-Cells)', s=50)
-    cancer_scatter = ax.scatter([], [], c='red', label='Cancer Cells', s=70)
-    ax.legend(loc='upper right')
-
-    def update(frame):
-        # Extract positions for active cells at current frame
-        current_frame_data = trajectories[:, frame, :]
-        
-        imm_idx = np.where(current_frame_data[:, 4] == 1)[0]
-        canc_idx = np.where(current_frame_data[:, 4] == 2)[0]
-        
-        immune_scatter.set_offsets(current_frame_data[imm_idx, 0:2])
-        cancer_scatter.set_offsets(current_frame_data[canc_idx, 0:2])
-        return immune_scatter, cancer_scatter
-
-    ani = animation.FuncAnimation(fig, update, frames=timesteps, interval=50, blit=True)
-    plt.show()
+if __name__ == "__main__":
+    print("Generating 50 Killing and 50 Non-Killing simulations inside 'simulation_data/'...")
+    for i in range(50):
+        generate_dataset('killing', i)
+        generate_dataset('non-killing', i)
+    print("All 100 simulation files successfully generated!")
 
 # What I'd improve
 

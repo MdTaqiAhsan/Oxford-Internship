@@ -99,7 +99,7 @@ import os
 def generate_dataset(mode, run_id):
     """Helper function to run a single simulation and save it with a unique ID inside a folder."""
     # Create the folder if it doesn't exist yet
-    output_dir = "simulation_data"
+    output_dir = "old_simulator/simulation_data"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         

@@ -53,7 +53,8 @@ if __name__ == "__main__":
     # Check if a filename was provided as a command-line argument
     if len(sys.argv) < 2:
         print("Usage error! Please provide a file trajectory path.")
-        print(r"Example: python simulation_viewer.py simulation_data\data_killing_0.npy")
+        print(r"Example: python old_simulator\simulation_viewer.py old_simulator\simulation_data\data_killing_0.npy")
     else:
         target_file = sys.argv[1]
         view_simulation(target_file)
+#python old_simulator\simulation_viewer.py old_simulator\simulation_data\data_killing_0.npy

@@ -73,7 +73,8 @@ def view_simulation(file_path):
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage error! Please provide a file trajectory path.")
-        print(r"Example: python new_simulation_viewer.py simulation_data\data_killing_0.npy")
+        print(r"Example: python new_simulator\new_simulation_viewer.py new_simulator\new_simulation_data\data_killing_0.npy")
     else:
         target_file = sys.argv[1]
         view_simulation(target_file)
+#python new_simulator\new_simulation_viewer.py new_simulator\new_simulation_data\data_killing_0.npy        

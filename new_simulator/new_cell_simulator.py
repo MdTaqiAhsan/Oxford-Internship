@@ -125,7 +125,7 @@ class CellSimulation:
         z = torch.zeros(N, device=dev)
         self.max_speed = blend(imm_scout, 1.6, 2.0, z)
         self.max_speed = blend(imm_cyto, 1.0, 1.4, self.max_speed)
-        self.max_speed = blend(can_sessile, 0.15, 0.35, self.max_speed)
+        self.max_speed = blend(can_sessile, 0.02, 0.35, self.max_speed)
         self.max_speed = blend(can_evasive, 0.8, 1.3, self.max_speed)
 
         self.sensing_radius = blend(imm_scout, 18, 24, z.clone())

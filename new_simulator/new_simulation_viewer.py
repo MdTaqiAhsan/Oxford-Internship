@@ -34,13 +34,13 @@ def view_simulation(file_path):
     # plus a faded one for dead cells so you can see where kills happened.
     scout_scatter = ax.scatter([], [], c='deepskyblue', label='Immune: scout', s=45,
                                 edgecolors='black', alpha=0.85)
-    cytotoxic_scatter = ax.scatter([], [], c='navy', label='Immune: cytotoxic', s=55,
+    cytotoxic_scatter = ax.scatter([], [], c='deepskyblue', label='Immune: cytotoxic', s=55,
                                     edgecolors='black', alpha=0.85)
-    sessile_scatter = ax.scatter([], [], c='orange', label='Cancer: sessile', s=65,
+    sessile_scatter = ax.scatter([], [], c='pink', label='Cancer: sessile', s=65,
                                   edgecolors='black', alpha=0.85)
-    evasive_scatter = ax.scatter([], [], c='red', label='Cancer: evasive', s=65,
+    evasive_scatter = ax.scatter([], [], c='pink', label='Cancer: evasive', s=65,
                                   edgecolors='black', alpha=0.85)
-    dead_scatter = ax.scatter([], [], c='lightgray', label='Dead', s=40,
+    dead_scatter = ax.scatter([], [], c='yellow', label='Dead', s=40,
                                edgecolors='black', alpha=0.5)
 
     ax.legend(loc='upper right', fontsize=8)

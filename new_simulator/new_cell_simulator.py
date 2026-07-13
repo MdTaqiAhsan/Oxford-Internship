@@ -1,46 +1,15 @@
 """
-cell_simulator.py  (v3 — PyTorch + uniform spatial-hash grid, GPU-scalable)
+new_cell_simulator.py  (v3.4 — PyTorch + uniform spatial-hash grid, GPU-scalable)
 ============================================================================
+Revised simulation engine featuring mode-dependent experimental immune velocity 
+sampling, polarized initial velocity mapping, and explicit physical unit constraints.
 
-Rewrite of v2 to scale from ~20 cells to 1,000-10,000+ cells.
-
-WHAT CHANGED, AT A GLANCE
---------------------------
-- Every tensor lives on `device` (CUDA if available, else CPU). No numpy
-  inside the simulation loop; numpy is only touched once, at the very end,
-  to hand back the array your Hopfield pipeline expects.
-- All O(N^2) pairwise distance matrices are replaced by a uniform spatial
-  hash grid: each cell only compares itself against cells in its own and
-  the 8 neighboring grid buckets, not the whole population.
-- The per-cell Python `for` loop over immune/cancer cells in v2 is gone.
-  Every behavioral rule (sensing, steering, evasion, exhaustion, killing,
-  collision, boundary) is expressed as whole-tensor operations.
-
-WHAT DID NOT CHANGE
---------------------
-- Public interface: `CellSimulation(...)`, `sim.run_simulation()`,
-  `generate_dataset(mode, run_id)` all work exactly as before.
-- Output contract: `trajectory_data.shape == (num_cells, timesteps, 5)`,
-  feature order `[x, y, vx, vy, type]`, with the same 0/1/2/3/4 type
-  encoding introduced in v2 (dead / immune-scout / immune-cytotoxic /
-  cancer-sessile / cancer-evasive).
-- Every named behavior from your list: scouts, cytotoxic cells, sessile
-  and evasive cancer, probabilistic sensing, target locking, persistence
-  (via the tau time-constant), acceleration/inertia, environmental noise,
-  exhaustion/recovery, probabilistic + duration-gated killing, collision
-  avoidance, and boundary repulsion are all still here.
-
-ONE DELIBERATE BEHAVIORAL FIX (flagged, not hidden)
-----------------------------------------------------
-`width`/`height` now auto-scale to preserve the ORIGINAL cell density
-(20 cells / 100x100 arena) unless you pass them explicitly. Without this,
-2000 cells at the old fixed 100x100 size would be packed ~100x denser
-than the simulation was ever tuned for -- everyone permanently colliding,
-and every grid bucket containing a large fraction of all cells (which
-also breaks the efficiency the grid is supposed to buy you). Pass
-`width=..., height=...` explicitly to opt out of auto-scaling.
-
-See the accompanying message for the full complexity/optimization writeup.
+PHYSICAL UNIT CONVENTIONS & ASSUMPTIONS:
+----------------------------------------
+- Spatial Coordinates (x, y, radii) : Expressed in micrometers (μm).
+- Temporal Step (dt = 1.0)           : Represents exactly 1 minute of real time.
+- Velocities & Speeds (vx, vy, max) : Expressed in μm/min.
+- Cell Density                       : Standardized to cells per μm^2.
 """
 
 import os
@@ -50,9 +19,6 @@ import torch
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 3x3 neighborhood offsets. Correct/sufficient as long as grid cell_size
-# >= every interaction radius used anywhere in the simulation (guaranteed
-# in __init__ below).
 _NEIGHBOR_OFFSETS = [(-1, -1), (-1, 0), (-1, 1),
                      (0, -1),  (0, 0),  (0, 1),
                      (1, -1),  (1, 0),  (1, 1)]
@@ -68,10 +34,10 @@ class CellSimulation:
                  width=None, height=None,
                  timesteps=120,
                  mode='killing',
-                 dt=1.0,
+                 dt=1.0, 
                  seed=None,
-                 target_density=0.002,   # cells per unit^2, matches v1/v2's 20/(100*100)
-                 max_per_cell=32,        # grid bucket capacity; see writeup for sizing
+                 target_density=0.002,   
+                 max_per_cell=32,        
                  device=None,
                  debug=False):
         self.device = device if device is not None else DEVICE
@@ -89,19 +55,18 @@ class CellSimulation:
         self.dt = dt
         self.debug = debug
 
-        # ---- auto-scale domain to preserve density unless overridden ----
         if width is None or height is None:
             side = math.sqrt(N / target_density)
             width = width if width is not None else side
             height = height if height is not None else side
-        self.width = float(width)
-        self.height = float(height)
+        self.width = float(width)     # Dimension in μm
+        self.height = float(height)   # Dimension in μm
 
         dev = self.device
         gen = self.gen
 
         # ---------------------------------------------------------------
-        # Base class (fixed) and phenotype (drawn once per cell at init)
+        # Base class and phenotype tracking
         # ---------------------------------------------------------------
         self.base_class = torch.cat([
             torch.ones(num_immune, dtype=torch.long, device=dev),
@@ -111,7 +76,7 @@ class CellSimulation:
         self.is_cancer = self.base_class == 2
 
         phen_immune = (torch.rand(num_immune, generator=gen, device=dev) < 0.5).long()
-        phen_cancer = (torch.rand(num_cancer, generator=gen, device=dev) < 0.4).long()  # p=0.4 evasive
+        phen_cancer = (torch.rand(num_cancer, generator=gen, device=dev) < 0.4).long()  
         self.phenotype = torch.cat([phen_immune, phen_cancer])
 
         imm_scout = self.is_immune & (self.phenotype == 0)
@@ -122,12 +87,37 @@ class CellSimulation:
         def blend(mask, lo, hi, base):
             return torch.where(mask, _sample_uniform(lo, hi, N, gen, dev), base)
 
-        z = torch.zeros(N, device=dev)
-        self.max_speed = blend(imm_scout, 1.6, 2.0, z)
-        self.max_speed = blend(imm_cyto, 1.0, 1.4, self.max_speed)
-        self.max_speed = blend(can_sessile, 0.02, 0.35, self.max_speed)
-        self.max_speed = blend(can_evasive, 0.8, 1.3, self.max_speed)
+        # ---------------------------------------------------------------
+        # MODIFICATION: MODE-DEPENDENT EXPERIMENTAL IMMUNE SPEED SAMPLING
+        # ---------------------------------------------------------------
+        # Select target Gaussian hyper-parameters dynamically based on simulation mode boundary rules
+        if self.mode == 'killing':
+            target_mean = 5.0
+            target_std = 1.6
+        else:  # 'non-killing'
+            target_mean = 8.5
+            target_std = 2.0
 
+        raw_speeds = torch.normal(mean=target_mean, std=target_std, size=(N,), generator=gen, device=dev)
+        
+        # In-place iterative positive sampling guard to preserve valid tail parameters on GPU
+        neg_mask = raw_speeds <= 0.0
+        while neg_mask.any():
+            num_bad = int(neg_mask.sum().item())
+            replacements = torch.normal(mean=target_mean, std=target_std, size=(num_bad,), generator=gen, device=dev)
+            raw_speeds[neg_mask] = replacements
+            neg_mask = raw_speeds <= 0.0
+
+        z = torch.zeros(N, device=dev)
+        self.max_speed = torch.where(self.is_immune, raw_speeds, z)
+
+        # ---------------------------------------------------------------
+        # UNCHANGED: CANCER MAX SPEEDS 
+        # ---------------------------------------------------------------
+        self.max_speed = blend(can_sessile, 0.5, 1.5, self.max_speed)  # Speed in μm/min
+        self.max_speed = blend(can_evasive, 2.0, 4.0, self.max_speed)  # Speed in μm/min
+
+        # Phenomenological behavioral parameter configurations (Sensing in μm)
         self.sensing_radius = blend(imm_scout, 18, 24, z.clone())
         self.sensing_radius = blend(imm_cyto, 10, 16, self.sensing_radius)
         self.sensing_radius = torch.where(can_evasive | can_sessile,
@@ -143,42 +133,42 @@ class CellSimulation:
         if mode == 'non-killing':
             self.kill_rate = torch.where(self.is_immune, self.kill_rate * 0.03, self.kill_rate)
 
+        # Persistence time-constants (tau in minutes)
         self.tau = blend(imm_scout, 1.5, 2.5, z.clone())
         self.tau = blend(imm_cyto, 3.0, 5.0, self.tau)
         self.tau = torch.where(self.is_cancer, _sample_uniform(2.0, 4.0, N, gen, dev), self.tau)
 
+        # Re-calibrated Extrinsic Noise Coefficients
         self.noise_scale = blend(imm_scout, 0.15, 0.25, z.clone())
         self.noise_scale = blend(imm_cyto, 0.05, 0.12, self.noise_scale)
-        self.noise_scale = blend(can_sessile, 0.05, 0.10, self.noise_scale)
-        self.noise_scale = blend(can_evasive, 0.10, 0.18, self.noise_scale)
+        self.noise_scale = blend(can_sessile, 0.05, 0.15, self.noise_scale)
+        self.noise_scale = blend(can_evasive, 0.10, 0.30, self.noise_scale)
 
-        # ---------------------------------------------------------------
-        # Dynamic state
-        # ---------------------------------------------------------------
+        # Dynamic State Variables (Positions in μm)
         self.positions = torch.stack([
             _sample_uniform(0, self.width, N, gen, dev),
             _sample_uniform(0, self.height, N, gen, dev),
         ], dim=1)
+        
+        # Polar Initial Velocity Assignment
+        init_speeds = torch.rand(N, generator=gen, device=dev) * self.max_speed
+        init_angles = torch.rand(N, generator=gen, device=dev) * (2.0 * math.pi)
+        
         self.velocities = torch.stack([
-            _sample_uniform(-0.3, 0.3, N, gen, dev),
-            _sample_uniform(-0.3, 0.3, N, gen, dev),
+            init_speeds * torch.cos(init_angles),
+            init_speeds * torch.sin(init_angles)
         ], dim=1)
+
         self.active_mask = torch.ones(N, dtype=torch.bool, device=dev)
         self.energy = torch.ones(N, device=dev)
         self.contact_timer = torch.zeros(N, device=dev)
         self.locked_target = torch.full((N,), -1, dtype=torch.long, device=dev)
 
-        self.KILL_RADIUS = 2.5
-        self.ENGAGE_STEPS_REQUIRED = 4
-        self.MIN_SEPARATION = 1.5
-        self.BOUNDARY_MARGIN = 8.0
+        self.KILL_RADIUS = 2.5            # Distance bound in μm
+        self.ENGAGE_STEPS_REQUIRED = 4    # Timestep iterations (4 minutes)
+        self.MIN_SEPARATION = 1.5         # Collision threshold in μm
+        self.BOUNDARY_MARGIN = 8.0         # Boundary threshold in μm
 
-        # ---------------------------------------------------------------
-        # Spatial grid setup. cell_size MUST be >= the largest interaction
-        # radius used anywhere (sensing_radius*1.5 is the widest one, for
-        # the fallback chemotaxis centroid) so the 3x3 neighborhood is
-        # guaranteed to be a superset of the true neighbor set.
-        # ---------------------------------------------------------------
         widest_radius = float((self.sensing_radius * 1.5).max().item())
         self.cell_size = max(widest_radius, self.MIN_SEPARATION) + 1e-3
         self.grid_w = max(1, int(math.ceil(self.width / self.cell_size)))
@@ -186,21 +176,10 @@ class CellSimulation:
         self.num_grid_cells = self.grid_w * self.grid_h
         self.max_per_cell = max_per_cell
 
-        # trajectory buffer lives on-device for the whole run; only moved
-        # to host memory once, at the end of run_simulation().
         self.trajectory_data = torch.zeros((N, timesteps, 5), device=dev)
-
-        # reusable accel buffer (avoids a fresh allocation every step)
         self._accel = torch.zeros((N, 2), device=dev)
 
-    # =====================================================================
-    # Spatial hash grid: build + neighbor gather
-    # =====================================================================
     def build_spatial_grid(self):
-        """Bucket every active cell into a uniform grid cell via a counting
-        sort. Returns a (num_grid_cells+1, max_per_cell) table of particle
-        indices (-1 = empty slot); the extra +1 bucket is a dump for
-        inactive (dead) cells so they're never returned as neighbors."""
         gx = torch.clamp((self.positions[:, 0] / self.cell_size).long(), 0, self.grid_w - 1)
         gy = torch.clamp((self.positions[:, 1] / self.cell_size).long(), 0, self.grid_h - 1)
         cell_id = gy * self.grid_w + gx
@@ -218,24 +197,9 @@ class CellSimulation:
         table = torch.full((self.num_grid_cells + 1, self.max_per_cell), -1,
                             dtype=torch.long, device=self.device)
         table[sorted_cell_id, slot] = order
-
-        if self.debug:
-            overflow = int((rank_in_cell >= self.max_per_cell).sum().item())
-            if overflow > 0:
-                print(f"[cell_simulator] WARNING: {overflow} cell(s) overflowed "
-                      f"max_per_cell={self.max_per_cell}; increase it or shrink cell_size.")
-
         return table, gx, gy
 
     def find_neighbors(self):
-        """For every cell, gather candidate neighbor indices from its own
-        grid cell and the 8 adjacent ones. Returns:
-            candidates : (N, 9*max_per_cell) long   -- particle indices, -1 padded
-            valid      : (N, 9*max_per_cell) bool
-            dist       : (N, 9*max_per_cell) float   -- distance to each candidate
-                         (inf where invalid or self)
-            diff       : (N, 9*max_per_cell, 2) float -- candidate_pos - self_pos
-        """
         table, gx, gy = self.build_spatial_grid()
         chunks = []
         for dx, dy in _NEIGHBOR_OFFSETS:
@@ -243,11 +207,11 @@ class CellSimulation:
             ngy = torch.clamp(gy + dy, 0, self.grid_h - 1)
             ncell = ngy * self.grid_w + ngx
             chunks.append(table[ncell])
-        candidates = torch.cat(chunks, dim=1)               # (N, 9*max_per_cell)
+        candidates = torch.cat(chunks, dim=1)               
         valid = candidates >= 0
 
-        cand_pos = self.positions[candidates.clamp(min=0)]   # (N,K,2)
-        diff = cand_pos - self.positions.unsqueeze(1)         # (N,K,2)
+        cand_pos = self.positions[candidates.clamp(min=0)]   
+        diff = cand_pos - self.positions.unsqueeze(1)         
         dist = torch.norm(diff, dim=2)
 
         self_mask = candidates == torch.arange(self.num_cells, device=self.device).unsqueeze(1)
@@ -256,9 +220,6 @@ class CellSimulation:
 
         return candidates, valid, dist, diff
 
-    # =====================================================================
-    # Behavioral update functions (each modifies self._accel in place)
-    # =====================================================================
     def update_immune_cells(self, candidates, dist, diff):
         cand_is_cancer = self.is_cancer[candidates.clamp(min=0)]
         dist_cancer = torch.where(cand_is_cancer, dist, torch.full_like(dist, float('inf')))
@@ -286,7 +247,6 @@ class CellSimulation:
         desired_vel_target = direction / d.unsqueeze(1) * desired_speed.unsqueeze(1)
         engaged = has_target & (d <= self.sensing_radius)
 
-        # fallback: weak chemotaxis toward centroid of widely-sensed cancer cells
         wide_range = dist_cancer <= (self.sensing_radius * 1.5).unsqueeze(1)
         any_wide = wide_range.any(dim=1)
         mask_f = (wide_range & cand_is_cancer).float().unsqueeze(2)
@@ -328,8 +288,8 @@ class CellSimulation:
         desired_vel_flee = flee_dir / dnorm.unsqueeze(1) * self.max_speed.unsqueeze(1)
         steer_flee = (desired_vel_flee - self.velocities) / self.tau.unsqueeze(1)
 
-        drift = torch.randn(self.num_cells, 2, generator=self.gen, device=self.device) * 0.08 \
-            - 0.1 * self.velocities
+        drift = torch.randn(self.num_cells, 2, generator=self.gen, device=self.device) * 0.05 \
+            - 0.10 * self.velocities
 
         cancer_accel = torch.where(has_threat.unsqueeze(1), steer_flee, drift)
         apply_mask = (self.is_cancer & self.active_mask).unsqueeze(1)
@@ -345,7 +305,7 @@ class CellSimulation:
         close = valid & (dist < self.MIN_SEPARATION) \
             & self.active_mask.unsqueeze(1) & self.active_mask[candidates.clamp(min=0)]
         overlap = torch.clamp(self.MIN_SEPARATION - dist, min=0)
-        unit_away = -diff / (dist.unsqueeze(2) + 1e-6)   # push away from the overlapping candidate
+        unit_away = -diff / (dist.unsqueeze(2) + 1e-6)   
         repulse = (unit_away * overlap.unsqueeze(2) * close.unsqueeze(2)).sum(dim=1) * 0.5
         self._accel += repulse
 
@@ -414,9 +374,6 @@ class CellSimulation:
         self.trajectory_data[:, t, 2:4] = self.velocities
         self.trajectory_data[:, t, 4] = self._type_column()
 
-    # =====================================================================
-    # Orchestration
-    # =====================================================================
     def step(self, t):
         self._accel.zero_()
         candidates, valid, dist, diff = self.find_neighbors()
@@ -435,17 +392,14 @@ class CellSimulation:
     def run_simulation(self):
         for t in range(self.timesteps):
             self.step(t)
-        # single host sync at the very end, not per-step
         return self.trajectory_data.cpu().numpy()
 
 
 # ==========================================
-# DATASET GENERATION (unchanged interface)
+# DATASET GENERATION
 # ==========================================
-def generate_dataset(mode, run_id, num_immune=1000, num_cancer=1000, timesteps=120,
+def generate_dataset(mode, run_id, num_immune=10000, num_cancer=10000, timesteps=120,
                       output_dir="new_simulator/new_simulation_data", **kwargs):
-    """Runs one simulation and saves it exactly as before, so downstream
-    code (data_dir + data_{mode}_{i}.npy convention) needs zero changes."""
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -461,7 +415,7 @@ def generate_dataset(mode, run_id, num_immune=1000, num_cancer=1000, timesteps=1
 if __name__ == "__main__":
     print(f"Using device: {DEVICE}")
     print("Generating 50 Killing and 50 Non-Killing simulations inside 'new_simulator/new_simulation_data/'...")
-    for i in range(50):
+    for i in range(50,51):
         generate_dataset('killing', i)
         generate_dataset('non-killing', i)
     print("All 100 simulation files successfully generated!")

@@ -1,1 +1,0 @@
-#python new_simulator\new_simulation_viewer.py new_simulator\new_simulation_data\data_killing_0.npy        

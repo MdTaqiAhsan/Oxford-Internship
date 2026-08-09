@@ -24,7 +24,7 @@ fig.patch.set_facecolor("#FFFFFF")
 ax.set_facecolor("#EEEEEE")
 
 # Determine domain boundaries
-max_x = np.max(trajectories[:, :, 0])   
+max_x = np.max(trajectories[:, :, 0])
 max_y = np.max(trajectories[:, :, 1])
 ax.set_xlim(0, max_x)
 ax.set_ylim(0, max_y)

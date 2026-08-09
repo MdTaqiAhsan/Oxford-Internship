@@ -1,25 +1,22 @@
 """
-new_cell_simulator.py (v6.8 — Fully Verified Production Simulator)
+new_cell_simulator.py (v7.1 — Kinematic Calibration Engine Fixed)
 ============================================================================
-Production-grade GPU immune-cancer simulation engine featuring dual spatial
-hashing, zero-copy masked fills, two-phase combat, density-gated 
-proliferation, exact tensor output compatibility, and low memory footprint.
+GPU-accelerated PyTorch immune-cancer microenvironment simulator.
+Features persistent track IDs, tri-phenotype immune coordination, continuous 
+chemotaxis, dynamic energy models, bidirectional combat, every-6-frame GPU
+kinematic sampling, and automated experimental CSV exports.
 
-OUTPUT CONTRACT (STRICTLY PRESERVED):
---------------------------------------
-- Shape  : (num_cells, timesteps, 5)
-- Layout : [x, y, vx, vy, type]
-- Types  : 0.0 = Dead Cell
-           1.0 = Immune Scout
-           1.4 = Immune Messenger
-           1.8 = Immune Killer
-           3.0 = Cancer Sessile
-           4.0 = Cancer Evasive
+CSV OUTPUT FORMAT (16 COLUMNS):
+TRACK_ID, FRAME, POSITION_X, POSITION_Y, DX_FROM_PREVIOUS_POINT,
+DY_FROM_PREVIOUS_POINT, DISPLACEMENT_FROM_PREVIOUS_POINT, DX_FROM_ORIGIN,
+DY_FROM_ORIGIN, DISPLACEMENT_FROM_ORIGIN, DISTANCE_TRAVELED, PATH_EFFICIENCY,
+VEL_X, VEL_Y, SPEED, AVERAGE_SPEED
 """
 
 import os
 import math
 import numpy as np
+import pandas as pd
 import torch
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -37,7 +34,8 @@ class CellSimulation:
     def __init__(self,
                  num_immune=1000, num_cancer=1000,
                  width=None, height=None,
-                 timesteps=120,
+                 timesteps=8635,             # Frame 0 to 8634 inclusive
+                 sample_interval=6,           # Sample every 6th frame
                  mode='killing',
                  dt=1.0,
                  seed=None,
@@ -50,8 +48,8 @@ class CellSimulation:
                  messenger_prob=0.30,
                  killer_prob=0.40,
                  target_lock_timeout=15,
-                 enable_proliferation=False,
-                 enable_apoptosis=False):
+                 enable_proliferation=False, # Strictly disabled for calibration
+                 enable_apoptosis=False):    # Strictly disabled for calibration
 
         self.device = device if device is not None else DEVICE
         self.gen = torch.Generator(device=self.device)
@@ -64,11 +62,16 @@ class CellSimulation:
         self.num_cancer = num_cancer
         self.num_cells = N = num_immune + num_cancer
         self.timesteps = timesteps
+        self.sample_interval = sample_interval
         self.mode = mode
         self.dt = dt
         self.debug = debug
         self.max_per_cell = max_per_cell
         self.max_signals_per_cell = max_signals_per_cell
+
+        # Compute number of recorded frames
+        self.recorded_frame_indices = list(range(0, timesteps, sample_interval))
+        self.num_recorded_frames = len(self.recorded_frame_indices)
 
         # Auto-scale simulation domain to maintain cell density
         if width is None or height is None:
@@ -82,8 +85,10 @@ class CellSimulation:
         self.messenger_prob = messenger_prob
         self.killer_prob = killer_prob
         self.target_lock_timeout = target_lock_timeout
-        self.enable_proliferation = enable_proliferation
-        self.enable_apoptosis = enable_apoptosis
+        
+        # Population Guard
+        self.enable_proliferation = False
+        self.enable_apoptosis = False
 
         self._initialize_constants()
         self._initialize_phenotypes()
@@ -124,6 +129,7 @@ class CellSimulation:
         self.AMPLIFY_COOLDOWN_STEPS = 5
         self.CHEMOTAXIS_EPSILON = 2.0
 
+        # Stochastic Signal Lifetime Parameters
         self.SIGNAL_LIFETIME_SCOUT_MEAN = 25.0
         self.SIGNAL_LIFETIME_SCOUT_STD = 5.0
         self.SIGNAL_LIFETIME_MSG_MEAN = 15.0
@@ -149,6 +155,7 @@ class CellSimulation:
         self.APOPTOSIS_PROB_IMMUNE = 0.0005
         self.APOPTOSIS_PROB_CANCER = 0.0002
 
+        # Swarming & Alignment Metrics
         self.ALIGNMENT_RADIUS_KILLER = 12.0
         self.ALIGNMENT_RADIUS_CANCER = 10.0
 
@@ -252,6 +259,11 @@ class CellSimulation:
         gen = self.gen
         N = self.num_cells
 
+        # Persistent Track IDs
+        immune_ids = torch.arange(1, self.num_immune + 1, dtype=torch.long, device=dev)
+        cancer_ids = torch.arange(1001, 1001 + self.num_cancer, dtype=torch.long, device=dev)
+        self.track_id = torch.cat([immune_ids, cancer_ids])
+
         self.positions = torch.stack([
             _sample_uniform(0, self.width, N, gen, dev),
             _sample_uniform(0, self.height, N, gen, dev),
@@ -282,7 +294,26 @@ class CellSimulation:
         self.grid_h = max(1, int(math.ceil(self.height / self.cell_size)))
         self.num_grid_cells = self.grid_w * self.grid_h
 
-        self.trajectory_data = torch.zeros((N, self.timesteps, 5), device=dev)
+        # Preallocated GPU Kinematic Recording Buffers
+        R = self.num_recorded_frames
+        self.recorded_active_mask = torch.zeros((N, R), dtype=torch.bool, device=dev)
+        self.rec_pos_x = torch.zeros((N, R), device=dev)
+        self.rec_pos_y = torch.zeros((N, R), device=dev)
+        self.rec_dx_prev = torch.zeros((N, R), device=dev)
+        self.rec_dy_prev = torch.zeros((N, R), device=dev)
+        self.rec_disp_prev = torch.zeros((N, R), device=dev)
+        self.rec_dx_orig = torch.zeros((N, R), device=dev)
+        self.rec_dy_orig = torch.zeros((N, R), device=dev)
+        self.rec_disp_orig = torch.zeros((N, R), device=dev)
+        self.rec_dist_traveled = torch.zeros((N, R), device=dev)
+        self.rec_path_efficiency = torch.zeros((N, R), device=dev)
+        self.rec_vel_x = torch.zeros((N, R), device=dev)
+        self.rec_vel_y = torch.zeros((N, R), device=dev)
+        self.rec_speed = torch.zeros((N, R), device=dev)
+        self.rec_avg_speed = torch.zeros((N, R), device=dev)
+
+        self.initial_pos = self.positions.clone()
+        self.cum_dist_traveled = torch.zeros(N, device=dev)
 
         self.stats_immune_alive = np.zeros(self.timesteps, dtype=np.int32)
         self.stats_cancer_alive = np.zeros(self.timesteps, dtype=np.int32)
@@ -350,8 +381,6 @@ class CellSimulation:
         dist = torch.norm(diff, dim=2)
 
         self_mask = candidates == torch.arange(self.num_cells, device=self.device).unsqueeze(1)
-        
-        # FIX: Removed unnecessary unsqueeze that triggered 3D tensor broadcasting
         invalid = (~valid) | self_mask | (~self.active_mask[candidates.clamp(min=0)])
         dist = dist.masked_fill(invalid, float('inf'))
 
@@ -372,14 +401,12 @@ class CellSimulation:
         diff = sig_cand_pos - self.positions.unsqueeze(1)
         dist = torch.norm(diff, dim=2)
 
-        # FIX: Removed unnecessary unsqueeze that triggered 3D tensor broadcasting
         invalid = (~valid) | (~self.signal_active[sig_candidates.clamp(min=0)])
         dist = dist.masked_fill(invalid, float('inf'))
 
         return sig_candidates, dist, diff
 
     def emit_signals(self, emit_mask, positions, strengths, cancer_ids, emitter_ids, emitter_types, t):
-        """Zero-Allocation Vectorized Signal Buffer Allocation."""
         if not emit_mask.any():
             return
 
@@ -474,7 +501,6 @@ class CellSimulation:
         nearest_val, nearest_idx = torch.min(search_dist, dim=1)
         has_any_within = nearest_val < float('inf')
 
-        # FIX: Correct 2D tensor index gather
         nearest_particle = torch.gather(candidates, 1, nearest_idx.unsqueeze(1)).squeeze(1)
 
         acquire = (tgt < 0) & has_any_within & self.is_immune & self.active_mask
@@ -702,84 +728,85 @@ class CellSimulation:
 
         self.stats_counterkills_phase2[t] = int(immune_killed.sum().item())
 
-    def process_proliferation_and_apoptosis(self, candidates, dist):
-        dev = self.device
-
-        if self.enable_apoptosis:
-            apop_prob = torch.where(self.is_immune, self.APOPTOSIS_PROB_IMMUNE, self.APOPTOSIS_PROB_CANCER)
-            apop_roll = torch.rand(self.num_cells, generator=self.gen, device=dev)
-            apop_mask = self.active_mask & (apop_roll < apop_prob)
-            self.active_mask = self.active_mask & (~apop_mask)
-
-        if self.enable_proliferation and self.active_mask.any():
-            cand_is_cancer = self.is_cancer[candidates.clamp(min=0)]
-            local_cancer_count = (cand_is_cancer & (dist < 15.0)).sum(dim=1).float()
-            density_factor = 1.0 / (1.0 + 0.3 * local_cancer_count)
-
-            prolif_prob = self.PROLIFERATION_PROB_BASE * density_factor
-            prolif_roll = torch.rand(self.num_cells, generator=self.gen, device=dev)
-            prolif_mask = self.is_cancer & self.active_mask & (prolif_roll < prolif_prob)
-
-            if prolif_mask.any():
-                inactive_slots = torch.nonzero(~self.active_mask, as_tuple=False).squeeze(1)
-                num_prolif = min(int(prolif_mask.sum().item()), len(inactive_slots))
-                if num_prolif > 0:
-                    parent_ids = torch.nonzero(prolif_mask, as_tuple=False).squeeze(1)[:num_prolif]
-                    child_ids = inactive_slots[:num_prolif]
-
-                    pos_offset = torch.randn((num_prolif, 2), device=dev) * 1.0
-                    vel_perturb = torch.randn((num_prolif, 2), device=dev) * 0.1
-                    
-                    new_pos = self.positions[parent_ids] + pos_offset
-                    new_pos[:, 0] = torch.clamp(new_pos[:, 0], 0.0, self.width)
-                    new_pos[:, 1] = torch.clamp(new_pos[:, 1], 0.0, self.height)
-                    
-                    self.positions[child_ids] = new_pos
-                    self.velocities[child_ids] = self.velocities[parent_ids] + vel_perturb
-
-                    self.base_class[child_ids] = 2
-                    self.phenotype[child_ids] = self.phenotype[parent_ids]
-                    self.active_mask[child_ids] = True
-                    self.energy[child_ids] = 0.8
-
-                    can_sessile = (self.phenotype[child_ids] == 0)
-
-                    self.max_speed[child_ids] = torch.where(
-                        can_sessile, _sample_uniform(self.CAN_SESSILE_SPEED[0], self.CAN_SESSILE_SPEED[1], num_prolif, self.gen, dev),
-                        _sample_uniform(self.CAN_EVASIVE_SPEED[0], self.CAN_EVASIVE_SPEED[1], num_prolif, self.gen, dev)
-                    )
-                    self.tau[child_ids] = _sample_uniform(self.TAU_CANCER[0], self.TAU_CANCER[1], num_prolif, self.gen, dev)
-                    self.sensing_radius[child_ids] = _sample_uniform(self.SENSING_CANCER[0], self.SENSING_CANCER[1], num_prolif, self.gen, dev)
-                    self.noise_scale[child_ids] = torch.where(
-                        can_sessile, _sample_uniform(0.02, 0.06, num_prolif, self.gen, dev),
-                        _sample_uniform(0.15, 0.35, num_prolif, self.gen, dev)
-                    )
-
-                    self.locked_target[child_ids] = -1
-                    self.contact_timer[child_ids] = 0
-                    self.immune_contact_timer[child_ids] = 0
-                    self.memory_bonus[child_ids] = 0.0
-                    self.combat_experience[child_ids] = 0.0
-                    self.last_cancer_seen_time[child_ids] = 0
-                    self.target_lost_timer[child_ids] = 0
-                    self.messenger_amp_cooldown[child_ids] = 0
-
-    def _type_column(self):
-        type_col = torch.zeros(self.num_cells, device=self.device)
-        immune_mask = self.is_immune & self.active_mask
-        cancer_mask = self.is_cancer & self.active_mask
-
-        type_col = torch.where(immune_mask, 1.0 + (self.phenotype.float() * 0.4), type_col)
-        type_col = torch.where(cancer_mask, 3.0 + self.phenotype.float(), type_col)
-        return type_col
-
     def _write_frame(self, t):
-        self.trajectory_data[:, t, 0:2] = self.positions
-        self.trajectory_data[:, t, 2:4] = self.velocities
-        self.trajectory_data[:, t, 4] = self._type_column()
-
+        # Update summary statistics every timestep
         self.stats_immune_alive[t] = int((self.is_immune & self.active_mask).sum().item())
         self.stats_cancer_alive[t] = int((self.is_cancer & self.active_mask).sum().item())
+
+        # Record kinematic features ONLY every sample_interval frames
+        if t % self.sample_interval == 0:
+            rec_idx = t // self.sample_interval
+
+            # Store active state mask for output filtering
+            self.recorded_active_mask[:, rec_idx] = self.active_mask
+
+            curr_pos_x = self.positions[:, 0]
+            curr_pos_y = self.positions[:, 1]
+            curr_vel_x = self.velocities[:, 0]
+            curr_vel_y = self.velocities[:, 1]
+
+            self.rec_pos_x[:, rec_idx] = curr_pos_x
+            self.rec_pos_y[:, rec_idx] = curr_pos_y
+            self.rec_vel_x[:, rec_idx] = curr_vel_x
+            self.rec_vel_y[:, rec_idx] = curr_vel_y
+
+            # Instantaneous speed
+            inst_speed = torch.norm(self.velocities, dim=1)
+            self.rec_speed[:, rec_idx] = inst_speed
+
+            if rec_idx == 0:
+                # Frame 0 initializations
+                self.rec_dx_prev[:, 0] = 0.0
+                self.rec_dy_prev[:, 0] = 0.0
+                self.rec_disp_prev[:, 0] = 0.0
+                self.rec_dx_orig[:, 0] = 0.0
+                self.rec_dy_orig[:, 0] = 0.0
+                self.rec_disp_orig[:, 0] = 0.0
+                self.rec_dist_traveled[:, 0] = 0.0
+                self.rec_path_efficiency[:, 0] = 1.0
+                self.rec_avg_speed[:, 0] = inst_speed
+            else:
+                prev_x = self.rec_pos_x[:, rec_idx - 1]
+                prev_y = self.rec_pos_y[:, rec_idx - 1]
+
+                dx_prev = curr_pos_x - prev_x
+                dy_prev = curr_pos_y - prev_y
+                disp_prev = torch.sqrt(dx_prev**2 + dy_prev**2)
+
+                # Update cumulative path length
+                self.cum_dist_traveled += disp_prev
+
+                orig_x = self.initial_pos[:, 0]
+                orig_y = self.initial_pos[:, 1]
+
+                dx_orig = curr_pos_x - orig_x
+                dy_orig = curr_pos_y - orig_y
+                disp_orig = torch.sqrt(dx_orig**2 + dy_orig**2)
+
+                # Safe Path Efficiency (1.0 if distance traveled is 0)
+                path_eff = torch.where(
+                    self.cum_dist_traveled > 1e-6,
+                    disp_orig / self.cum_dist_traveled,
+                    torch.ones_like(disp_orig)
+                )
+                path_eff = torch.clamp(path_eff, 0.0, 1.0)
+
+                # FIXED: Use Python 'if' since elapsed_time is a scalar constant for the frame
+                elapsed_time = float(t * self.dt)
+                if elapsed_time > 0:
+                    avg_spd = self.cum_dist_traveled / elapsed_time
+                else:
+                    avg_spd = inst_speed
+
+                self.rec_dx_prev[:, rec_idx] = dx_prev
+                self.rec_dy_prev[:, rec_idx] = dy_prev
+                self.rec_disp_prev[:, rec_idx] = disp_prev
+                self.rec_dx_orig[:, rec_idx] = dx_orig
+                self.rec_dy_orig[:, rec_idx] = dy_orig
+                self.rec_disp_orig[:, rec_idx] = disp_orig
+                self.rec_dist_traveled[:, rec_idx] = self.cum_dist_traveled
+                self.rec_path_efficiency[:, rec_idx] = path_eff
+                self.rec_avg_speed[:, rec_idx] = avg_spd
 
     def step(self, t):
         self._accel.zero_()
@@ -802,8 +829,6 @@ class CellSimulation:
         candidates_post1, _, dist_post1, _ = self.find_neighbors(cached_gx=gx, cached_gy=gy)
         self.perform_killing_phase2_cancer_counterattack(candidates_post1, dist_post1, t)
 
-        self.process_proliferation_and_apoptosis(candidates_post1, dist_post1)
-
         self.integrate_motion()
         self._write_frame(t)
 
@@ -811,7 +836,7 @@ class CellSimulation:
         with torch.inference_mode():
             for t in range(self.timesteps):
                 self.step(t)
-                if self.device.type == 'cuda' and t % 5 == 0:
+                if self.device.type == 'cuda' and t % 100 == 0:
                     torch.cuda.empty_cache()
 
         stats = {
@@ -820,29 +845,128 @@ class CellSimulation:
             "kills_phase1": self.stats_kills_phase1,
             "counterkills_phase2": self.stats_counterkills_phase2,
         }
-        return self.trajectory_data.cpu().numpy(), stats
+        return stats
+
+    def export_kinematics_csv(self, output_dir):
+        """Transfers preallocated GPU buffers to CPU and writes 2 CSV files."""
+        os.makedirs(output_dir, exist_ok=True)
+        R = self.num_recorded_frames
+
+        # Single batch transfer from GPU to CPU
+        track_ids = self.track_id.cpu().numpy()
+        rec_frames = np.array(self.recorded_frame_indices, dtype=np.int32)
+        
+        act_mask = self.recorded_active_mask.cpu().numpy()
+        pos_x = self.rec_pos_x.cpu().numpy()
+        pos_y = self.rec_pos_y.cpu().numpy()
+        dx_prev = self.rec_dx_prev.cpu().numpy()
+        dy_prev = self.rec_dy_prev.cpu().numpy()
+        disp_prev = self.rec_disp_prev.cpu().numpy()
+        dx_orig = self.rec_dx_orig.cpu().numpy()
+        dy_orig = self.rec_dy_orig.cpu().numpy()
+        disp_orig = self.rec_disp_orig.cpu().numpy()
+        dist_trav = self.rec_dist_traveled.cpu().numpy()
+        path_eff = self.rec_path_efficiency.cpu().numpy()
+        vel_x = self.rec_vel_x.cpu().numpy()
+        vel_y = self.rec_vel_y.cpu().numpy()
+        speed = self.rec_speed.cpu().numpy()
+        avg_speed = self.rec_avg_speed.cpu().numpy()
+
+        t_cell_rows = []
+        cancer_cell_rows = []
+
+        for cell_idx in range(self.num_cells):
+            t_id = track_ids[cell_idx]
+            is_immune_cell = (t_id <= 1000)
+
+            for rec_idx in range(R):
+                # Stop recording trajectory after death frame
+                if not act_mask[cell_idx, rec_idx]:
+                    break
+
+                frame_val = rec_frames[rec_idx]
+                row = [
+                    t_id,
+                    frame_val,
+                    pos_x[cell_idx, rec_idx],
+                    pos_y[cell_idx, rec_idx],
+                    dx_prev[cell_idx, rec_idx],
+                    dy_prev[cell_idx, rec_idx],
+                    disp_prev[cell_idx, rec_idx],
+                    dx_orig[cell_idx, rec_idx],
+                    dy_orig[cell_idx, rec_idx],
+                    disp_orig[cell_idx, rec_idx],
+                    dist_trav[cell_idx, rec_idx],
+                    path_eff[cell_idx, rec_idx],
+                    vel_x[cell_idx, rec_idx],
+                    vel_y[cell_idx, rec_idx],
+                    speed[cell_idx, rec_idx],
+                    avg_speed[cell_idx, rec_idx],
+                ]
+
+                if is_immune_cell:
+                    t_cell_rows.append(row)
+                else:
+                    cancer_cell_rows.append(row)
+
+        columns = [
+            "TRACK_ID", "FRAME", "POSITION_X", "POSITION_Y",
+            "DX_FROM_PREVIOUS_POINT", "DY_FROM_PREVIOUS_POINT",
+            "DISPLACEMENT_FROM_PREVIOUS_POINT", "DX_FROM_ORIGIN",
+            "DY_FROM_ORIGIN", "DISPLACEMENT_FROM_ORIGIN",
+            "DISTANCE_TRAVELED", "PATH_EFFICIENCY", "VEL_X", "VEL_Y",
+            "SPEED", "AVERAGE_SPEED"
+        ]
+
+        df_tcell = pd.DataFrame(t_cell_rows, columns=columns)
+        df_cancer = pd.DataFrame(cancer_cell_rows, columns=columns)
+
+        # Sanity Validation Checks
+        assert len(df_tcell['TRACK_ID'].unique()) <= 1000, "Validation Error: Excess T-cell track IDs"
+        assert len(df_cancer['TRACK_ID'].unique()) <= 1000, "Validation Error: Excess Cancer track IDs"
+        assert (df_tcell['TRACK_ID'].min() >= 1) and (df_tcell['TRACK_ID'].max() <= 1000), "Validation Error: T-cell ID range"
+        assert (df_cancer['TRACK_ID'].min() >= 1001) and (df_cancer['TRACK_ID'].max() <= 2000), "Validation Error: Cancer ID range"
+        assert (df_tcell['SPEED'] >= 0).all(), "Validation Error: Negative speed in T-cells"
+        assert (df_cancer['SPEED'] >= 0).all(), "Validation Error: Negative speed in Cancer"
+        assert not df_tcell.isnull().values.any(), "Validation Error: NaN/Inf detected in T-cell kinematics"
+        assert not df_cancer.isnull().values.any(), "Validation Error: NaN/Inf detected in Cancer kinematics"
+
+        tcell_filename = os.path.join(output_dir, f"{self.mode}_T-cell_kinematics.csv")
+        cancer_filename = os.path.join(output_dir, f"{self.mode}_Cancer-cell_kinematics.csv")
+
+        df_tcell.to_csv(tcell_filename, index=False)
+        df_cancer.to_csv(cancer_filename, index=False)
+
+        return tcell_filename, cancer_filename
 
 
-# ==========================================
-# DATASET GENERATION (PIPELINE COMPATIBLE)
-# ==========================================
-def generate_dataset(mode, run_id, num_immune=1000, num_cancer=1000, timesteps=120,
-                      output_dir="new_simulator/new_simulation_data", **kwargs):
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
+# ============================================================
+# KINEMATIC TRACKING / DATASET CALIBRATION: Execution Pipeline
+# ============================================================
+def generate_dataset(mode, run_id=0, num_immune=1000, num_cancer=1000, timesteps=8635,
+                      output_dir="new_simulator/kinematic_csv_outputs", **kwargs):
     seed = hash((mode, run_id)) % (2**32)
     sim = CellSimulation(num_immune=num_immune, num_cancer=num_cancer,
                           timesteps=timesteps, mode=mode, seed=seed, **kwargs)
-    trajectories, summary_stats = sim.run_simulation()
+    
+    summary_stats = sim.run_simulation()
+    tcell_csv, cancer_csv = sim.export_kinematics_csv(output_dir)
 
-    filename = os.path.join(output_dir, f"data_{mode}_{run_id}.npy")
-    np.save(filename, trajectories)
+    print(f"\n============================================================")
+    print(f"Mode: {mode}")
+    print(f"Simulation frames: {timesteps}")
+    print(f"Recorded frames: {sim.num_recorded_frames}")
+    print(f"Immune cells: {num_immune} (TRACK_IDs 1-1000)")
+    print(f"Cancer cells: {num_cancer} (TRACK_IDs 1001-2000)")
+    print(f"Output:")
+    print(f"    {tcell_csv}")
+    print(f"    {cancer_csv}")
+    print(f"============================================================\n")
 
 
 if __name__ == "__main__":
     print(f"Using execution hardware device: {DEVICE}")
-    print("Generating 1 Killing and 1 Non-Killing benchmark simulation in 'new_simulator/new_simulation_data/'...")
+    print("Generating experimental kinematic datasets for Killing and Non-Killing modes...")
     generate_dataset('killing', 0)
     generate_dataset('non-killing', 0)
-    print("Simulation dataset successfully generated!")
+    print("All 4 kinematic comparison CSV files successfully exported!")

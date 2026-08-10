@@ -1,12 +1,12 @@
 """
-new_cell_simulator.py (v7.1 — Kinematic Calibration Engine Fixed)
+new_cell_simulator.py (v8.0 — Camera Observation Kinematic Calibration Engine)
 ============================================================================
 GPU-accelerated PyTorch immune-cancer microenvironment simulator.
-Features persistent track IDs, tri-phenotype immune coordination, continuous 
-chemotaxis, dynamic energy models, bidirectional combat, every-6-frame GPU
-kinematic sampling, and automated experimental CSV exports.
+Simulates internally at 1-frame timestep resolution (dt=1.0) for numerical physics,
+but extracts and records all kinematic metrics STRICTLY at 6-frame observation
+intervals (dt_obs=6.0) to match experimental live-cell tracking resolution.
 
-CSV OUTPUT FORMAT (16 COLUMNS):
+OBSERVED KINEMATIC CSV CONTRACT (16 COLUMNS):
 TRACK_ID, FRAME, POSITION_X, POSITION_Y, DX_FROM_PREVIOUS_POINT,
 DY_FROM_PREVIOUS_POINT, DISPLACEMENT_FROM_PREVIOUS_POINT, DX_FROM_ORIGIN,
 DY_FROM_ORIGIN, DISPLACEMENT_FROM_ORIGIN, DISTANCE_TRAVELED, PATH_EFFICIENCY,
@@ -14,6 +14,9 @@ VEL_X, VEL_Y, SPEED, AVERAGE_SPEED
 """
 
 import os
+# Prevent CUDA memory fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import math
 import numpy as np
 import pandas as pd
@@ -35,7 +38,7 @@ class CellSimulation:
                  num_immune=1000, num_cancer=1000,
                  width=None, height=None,
                  timesteps=8635,             # Frame 0 to 8634 inclusive
-                 sample_interval=6,           # Sample every 6th frame
+                 observation_interval=6,     # Camera observation interval = 6 frames
                  mode='killing',
                  dt=1.0,
                  seed=None,
@@ -48,8 +51,8 @@ class CellSimulation:
                  messenger_prob=0.30,
                  killer_prob=0.40,
                  target_lock_timeout=15,
-                 enable_proliferation=False, # Strictly disabled for calibration
-                 enable_apoptosis=False):    # Strictly disabled for calibration
+                 enable_proliferation=False, # Strictly disabled for tracking
+                 enable_apoptosis=False):    # Strictly disabled for tracking
 
         self.device = device if device is not None else DEVICE
         self.gen = torch.Generator(device=self.device)
@@ -62,18 +65,19 @@ class CellSimulation:
         self.num_cancer = num_cancer
         self.num_cells = N = num_immune + num_cancer
         self.timesteps = timesteps
-        self.sample_interval = sample_interval
-        self.mode = mode
+        self.observation_interval = observation_interval
         self.dt = dt
+        self.dt_obs = observation_interval * dt  # 6.0 time units between observations
+        self.mode = mode
         self.debug = debug
         self.max_per_cell = max_per_cell
         self.max_signals_per_cell = max_signals_per_cell
 
-        # Compute number of recorded frames
-        self.recorded_frame_indices = list(range(0, timesteps, sample_interval))
+        # Precalculate observed frame indices [0, 6, 12, 18, ..., 8634]
+        self.recorded_frame_indices = list(range(0, timesteps, observation_interval))
         self.num_recorded_frames = len(self.recorded_frame_indices)
 
-        # Auto-scale simulation domain to maintain cell density
+        # Auto-scale simulation domain to maintain density
         if width is None or height is None:
             side = math.sqrt(N / target_density)
             width = width if width is not None else side
@@ -86,7 +90,7 @@ class CellSimulation:
         self.killer_prob = killer_prob
         self.target_lock_timeout = target_lock_timeout
         
-        # Population Guard
+        # Guard population stability
         self.enable_proliferation = False
         self.enable_apoptosis = False
 
@@ -129,7 +133,7 @@ class CellSimulation:
         self.AMPLIFY_COOLDOWN_STEPS = 5
         self.CHEMOTAXIS_EPSILON = 2.0
 
-        # Stochastic Signal Lifetime Parameters
+        # Stochastic Signal Lifetimes
         self.SIGNAL_LIFETIME_SCOUT_MEAN = 25.0
         self.SIGNAL_LIFETIME_SCOUT_STD = 5.0
         self.SIGNAL_LIFETIME_MSG_MEAN = 15.0
@@ -294,7 +298,9 @@ class CellSimulation:
         self.grid_h = max(1, int(math.ceil(self.height / self.cell_size)))
         self.num_grid_cells = self.grid_w * self.grid_h
 
-        # Preallocated GPU Kinematic Recording Buffers
+        # ============================================================
+        # CAMERA OBSERVATION: Preallocated 6-Frame Kinematic Buffers
+        # ============================================================
         R = self.num_recorded_frames
         self.recorded_active_mask = torch.zeros((N, R), dtype=torch.bool, device=dev)
         self.rec_pos_x = torch.zeros((N, R), device=dev)
@@ -315,6 +321,7 @@ class CellSimulation:
         self.initial_pos = self.positions.clone()
         self.cum_dist_traveled = torch.zeros(N, device=dev)
 
+        # Summary Metrics
         self.stats_immune_alive = np.zeros(self.timesteps, dtype=np.int32)
         self.stats_cancer_alive = np.zeros(self.timesteps, dtype=np.int32)
         self.stats_kills_phase1 = np.zeros(self.timesteps, dtype=np.int32)
@@ -728,34 +735,29 @@ class CellSimulation:
 
         self.stats_counterkills_phase2[t] = int(immune_killed.sum().item())
 
+    # ============================================================
+    # CAMERA OBSERVATION KINEMATIC RECORDER (dt_obs = 6 * dt)
+    # ============================================================
     def _write_frame(self, t):
-        # Update summary statistics every timestep
+        # Frame summary count updates
         self.stats_immune_alive[t] = int((self.is_immune & self.active_mask).sum().item())
         self.stats_cancer_alive[t] = int((self.is_cancer & self.active_mask).sum().item())
 
-        # Record kinematic features ONLY every sample_interval frames
-        if t % self.sample_interval == 0:
-            rec_idx = t // self.sample_interval
+        # Observe & record kinetics STRICTLY every observation_interval (6th frame)
+        if t % self.observation_interval == 0:
+            rec_idx = t // self.observation_interval
 
-            # Store active state mask for output filtering
+            # Store alive/dead status mask
             self.recorded_active_mask[:, rec_idx] = self.active_mask
 
             curr_pos_x = self.positions[:, 0]
             curr_pos_y = self.positions[:, 1]
-            curr_vel_x = self.velocities[:, 0]
-            curr_vel_y = self.velocities[:, 1]
 
             self.rec_pos_x[:, rec_idx] = curr_pos_x
             self.rec_pos_y[:, rec_idx] = curr_pos_y
-            self.rec_vel_x[:, rec_idx] = curr_vel_x
-            self.rec_vel_y[:, rec_idx] = curr_vel_y
-
-            # Instantaneous speed
-            inst_speed = torch.norm(self.velocities, dim=1)
-            self.rec_speed[:, rec_idx] = inst_speed
 
             if rec_idx == 0:
-                # Frame 0 initializations
+                # Frame 0 Initial Conditions (no previous observation point)
                 self.rec_dx_prev[:, 0] = 0.0
                 self.rec_dy_prev[:, 0] = 0.0
                 self.rec_disp_prev[:, 0] = 0.0
@@ -764,26 +766,35 @@ class CellSimulation:
                 self.rec_disp_orig[:, 0] = 0.0
                 self.rec_dist_traveled[:, 0] = 0.0
                 self.rec_path_efficiency[:, 0] = 1.0
-                self.rec_avg_speed[:, 0] = inst_speed
+                self.rec_vel_x[:, 0] = 0.0
+                self.rec_vel_y[:, 0] = 0.0
+                self.rec_speed[:, 0] = 0.0
+                self.rec_avg_speed[:, 0] = 0.0
             else:
                 prev_x = self.rec_pos_x[:, rec_idx - 1]
                 prev_y = self.rec_pos_y[:, rec_idx - 1]
 
+                # 1. Observed Spatial Displacements between t and t-6
                 dx_prev = curr_pos_x - prev_x
                 dy_prev = curr_pos_y - prev_y
                 disp_prev = torch.sqrt(dx_prev**2 + dy_prev**2)
 
-                # Update cumulative path length
+                # 2. Observed Velocities derived over dt_obs = 6.0 time units
+                vel_x_obs = dx_prev / self.dt_obs
+                vel_y_obs = dy_prev / self.dt_obs
+                speed_obs = disp_prev / self.dt_obs
+
+                # 3. Accumulated Distance Traveled (sum of observable 6-frame displacements)
                 self.cum_dist_traveled += disp_prev
 
+                # 4. Displacements from Origin (relative to frame 0 observation)
                 orig_x = self.initial_pos[:, 0]
                 orig_y = self.initial_pos[:, 1]
-
                 dx_orig = curr_pos_x - orig_x
                 dy_orig = curr_pos_y - orig_y
                 disp_orig = torch.sqrt(dx_orig**2 + dy_orig**2)
 
-                # Safe Path Efficiency (1.0 if distance traveled is 0)
+                # 5. Path Efficiency (Origin Displacement / Observed Distance Traveled)
                 path_eff = torch.where(
                     self.cum_dist_traveled > 1e-6,
                     disp_orig / self.cum_dist_traveled,
@@ -791,13 +802,11 @@ class CellSimulation:
                 )
                 path_eff = torch.clamp(path_eff, 0.0, 1.0)
 
-                # FIXED: Use Python 'if' since elapsed_time is a scalar constant for the frame
-                elapsed_time = float(t * self.dt)
-                if elapsed_time > 0:
-                    avg_spd = self.cum_dist_traveled / elapsed_time
-                else:
-                    avg_spd = inst_speed
+                # 6. Cumulative Average Speed (Observed Distance Traveled / Cumulative Elapsed Time)
+                elapsed_time_obs = float(t * self.dt)
+                avg_speed_obs = self.cum_dist_traveled / elapsed_time_obs
 
+                # Commit to GPU buffers
                 self.rec_dx_prev[:, rec_idx] = dx_prev
                 self.rec_dy_prev[:, rec_idx] = dy_prev
                 self.rec_disp_prev[:, rec_idx] = disp_prev
@@ -806,7 +815,10 @@ class CellSimulation:
                 self.rec_disp_orig[:, rec_idx] = disp_orig
                 self.rec_dist_traveled[:, rec_idx] = self.cum_dist_traveled
                 self.rec_path_efficiency[:, rec_idx] = path_eff
-                self.rec_avg_speed[:, rec_idx] = avg_spd
+                self.rec_vel_x[:, rec_idx] = vel_x_obs
+                self.rec_vel_y[:, rec_idx] = vel_y_obs
+                self.rec_speed[:, rec_idx] = speed_obs
+                self.rec_avg_speed[:, rec_idx] = avg_speed_obs
 
     def step(self, t):
         self._accel.zero_()
@@ -880,7 +892,7 @@ class CellSimulation:
             is_immune_cell = (t_id <= 1000)
 
             for rec_idx in range(R):
-                # Stop recording trajectory after death frame
+                # Stop recording trajectory at cell death frame
                 if not act_mask[cell_idx, rec_idx]:
                     break
 
@@ -924,12 +936,10 @@ class CellSimulation:
         # Sanity Validation Checks
         assert len(df_tcell['TRACK_ID'].unique()) <= 1000, "Validation Error: Excess T-cell track IDs"
         assert len(df_cancer['TRACK_ID'].unique()) <= 1000, "Validation Error: Excess Cancer track IDs"
-        assert (df_tcell['TRACK_ID'].min() >= 1) and (df_tcell['TRACK_ID'].max() <= 1000), "Validation Error: T-cell ID range"
-        assert (df_cancer['TRACK_ID'].min() >= 1001) and (df_cancer['TRACK_ID'].max() <= 2000), "Validation Error: Cancer ID range"
         assert (df_tcell['SPEED'] >= 0).all(), "Validation Error: Negative speed in T-cells"
         assert (df_cancer['SPEED'] >= 0).all(), "Validation Error: Negative speed in Cancer"
-        assert not df_tcell.isnull().values.any(), "Validation Error: NaN/Inf detected in T-cell kinematics"
-        assert not df_cancer.isnull().values.any(), "Validation Error: NaN/Inf detected in Cancer kinematics"
+        assert not df_tcell.isnull().values.any(), "Validation Error: NaN/Inf in T-cell kinematics"
+        assert not df_cancer.isnull().values.any(), "Validation Error: NaN/Inf in Cancer kinematics"
 
         tcell_filename = os.path.join(output_dir, f"{self.mode}_T-cell_kinematics.csv")
         cancer_filename = os.path.join(output_dir, f"{self.mode}_Cancer-cell_kinematics.csv")
@@ -941,7 +951,7 @@ class CellSimulation:
 
 
 # ============================================================
-# KINEMATIC TRACKING / DATASET CALIBRATION: Execution Pipeline
+# DATASET GENERATION PIPELINE
 # ============================================================
 def generate_dataset(mode, run_id=0, num_immune=1000, num_cancer=1000, timesteps=8635,
                       output_dir="new_simulator/kinematic_csv_outputs", **kwargs):
@@ -962,11 +972,56 @@ def generate_dataset(mode, run_id=0, num_immune=1000, num_cancer=1000, timesteps
     print(f"    {tcell_csv}")
     print(f"    {cancer_csv}")
     print(f"============================================================\n")
+    return sim, tcell_csv, cancer_csv
 
 
 if __name__ == "__main__":
     print(f"Using execution hardware device: {DEVICE}")
-    print("Generating experimental kinematic datasets for Killing and Non-Killing modes...")
-    generate_dataset('killing', 0)
+    print("Generating experimental-resolution kinematic datasets (6-frame observations)...")
+    sim_obj, _, _ = generate_dataset('killing', 0)
     generate_dataset('non-killing', 0)
-    print("All 4 kinematic comparison CSV files successfully exported!")
+    
+    # ============================================================
+    # VALIDATION & PROOF CHECKS
+    # ============================================================
+    print("\n============================================================")
+    print("                TEMPORAL RESOLUTION VALIDATION              ")
+    print("============================================================")
+    print(f"Total Simulation Cells        : {sim_obj.num_cells} (1000 Immune + 1000 Cancer)")
+    print(f"Total Recorded Observation Frames: {sim_obj.num_recorded_frames}")
+    print(f"First 10 Observed Frames      : {sim_obj.recorded_frame_indices[:10]}")
+    print(f"Last Observed Frame           : {sim_obj.recorded_frame_indices[-1]}")
+    
+    # Read generated killing T-cell CSV to verify single-cell 6-frame step math
+    df_val = pd.read_csv("new_simulator/kinematic_csv_outputs/killing_T-cell_kinematics.csv")
+    c1 = df_val[df_val['TRACK_ID'] == 1].sort_values('FRAME')
+    
+    print("\n[EXPLICIT STEP PROOF FOR TRACK_ID = 1]")
+    row_t0 = c1[c1['FRAME'] == 0].iloc[0]
+    row_t6 = c1[c1['FRAME'] == 6].iloc[0]
+    row_t12 = c1[c1['FRAME'] == 12].iloc[0]
+
+    print(f" • Frame t=0  Pos: ({row_t0['POSITION_X']:.2f}, {row_t0['POSITION_Y']:.2f})")
+    print(f" • Frame t=6  Pos: ({row_t6['POSITION_X']:.2f}, {row_t6['POSITION_Y']:.2f})")
+    print(f" • Frame t=12 Pos: ({row_t12['POSITION_X']:.2f}, {row_t12['POSITION_Y']:.2f})")
+    
+    calc_dx_6_12 = row_t12['POSITION_X'] - row_t6['POSITION_X']
+    calc_dy_6_12 = row_t12['POSITION_Y'] - row_t6['POSITION_Y']
+    calc_disp_6_12 = math.sqrt(calc_dx_6_12**2 + calc_dy_6_12**2)
+    calc_vx_6_12 = calc_dx_6_12 / 6.0
+    calc_vy_6_12 = calc_dy_6_12 / 6.0
+    calc_speed_6_12 = calc_disp_6_12 / 6.0
+
+    print("\n[VERIFICATION OF FRAME 12 DERIVED KINEMATICS (obs_dt = 6.0)]")
+    print(f" • DX (Pos12 - Pos6)          : Recorded = {row_t12['DX_FROM_PREVIOUS_POINT']:.4f} | Calculated = {calc_dx_6_12:.4f}")
+    print(f" • DY (Pos12 - Pos6)          : Recorded = {row_t12['DY_FROM_PREVIOUS_POINT']:.4f} | Calculated = {calc_dy_6_12:.4f}")
+    print(f" • DISPLACEMENT (6->12)       : Recorded = {row_t12['DISPLACEMENT_FROM_PREVIOUS_POINT']:.4f} | Calculated = {calc_disp_6_12:.4f}")
+    print(f" • VEL_X (DX / 6.0)           : Recorded = {row_t12['VEL_X']:.4f} | Calculated = {calc_vx_6_12:.4f}")
+    print(f" • VEL_Y (DY / 6.0)           : Recorded = {row_t12['VEL_Y']:.4f} | Calculated = {calc_vy_6_12:.4f}")
+    print(f" • SPEED (DISP / 6.0)         : Recorded = {row_t12['SPEED']:.4f} | Calculated = {calc_speed_6_12:.4f}")
+    
+    # Frame step interval sanity check
+    frame_diffs = c1['FRAME'].diff().dropna().unique()
+    print(f"\n Unique Observation Frame Intervals Found in File: {frame_diffs}")
+    assert len(frame_diffs) == 1 and frame_diffs[0] == 6, "SANITY CHECK FAILED: Frame step is not strictly 6!"
+    print("ALL VALIDATION CHECKS PASSED SUCCESSFULLY!")

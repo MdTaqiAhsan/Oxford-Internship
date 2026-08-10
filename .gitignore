@@ -1,0 +1,26 @@
+# Python virtual environment
+hopfield_gpu_env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Experimental datasets
+cyto_2023_11_21_tcell_04.csv
+cyto_2023_11_21_ccell_04.csv
+
+# Extracted kinematic datasets
+T-Cell Kinematics.csv
+Cancer Cell Kinematics.csv
+
+# Simulation outputs
+new_simulator/new_simulation_data/
+new_simulator/kinematic_csv_outputs/
+
+# NumPy simulation outputs
+*.npy
+*.npz
+
+# Excel outputs
+*.xlsx
+*.xls

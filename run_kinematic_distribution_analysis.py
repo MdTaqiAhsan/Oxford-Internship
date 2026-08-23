@@ -3,13 +3,17 @@ run_kinematic_distribution_analysis.py
 ================================================================================
 Scientific Quantitative Distribution Comparison Analysis for Cell Kinematics
 --------------------------------------------------------------------------------
-Computes mathematical similarity metrics (Wasserstein Distance, 2-Sample KS
-Statistic, and Jensen-Shannon Divergence) across 14 kinematic features and 4
-one-to-one regime-matched experimental-vs-simulation comparisons in both Raw
-Physical Units and Experimental Reference Standardized Z-Score Units.
+Compares 4 regime-matched experimental datasets against 4 simulation datasets.
+Filters full-frame simulation CSVs to observational frames (FRAME % 6 == 0)
+where kinematic features represent the instantaneous preceding 1-frame step.
 
-Exports metric tables, statistics summaries, publication heatmaps, and a
-dynamically generated scientific Markdown report.
+Evaluates mathematical similarity via:
+  1. Primary Analysis: Raw Physical Units (Wasserstein, KS, JSD)
+  2. Secondary Diagnostic Analysis: Experimental Reference Standardized Z-Scores
+     (Wasserstein in sigma_exp, KS, JSD, Delta_Z)
+
+Exports comprehensive CSV metric tables, feature statistics, publication heatmaps,
+and a dynamically populated Markdown report.
 ================================================================================
 """
 
@@ -24,7 +28,6 @@ import seaborn as sns
 # =============================================================================
 # 1. FILE PATHS AND DIRECTORY CONFIGURATION (8 DISTINCT DATASETS)
 # =============================================================================
-# Four Experimental Regimes
 EXPERIMENTAL_KILLING_CANCER = (
     r"C:\Users\taqio\OneDrive\Desktop\CSE\Oxford Internship"
     r"\Oxford-Internship\Cyto_Cancer Cell Kinematics.csv"
@@ -45,7 +48,6 @@ EXPERIMENTAL_NONKILLING_TCELL = (
     r"\Oxford-Internship\Wt_T-Cell Kinematics.csv"
 )
 
-# Four Simulation Regimes
 KILLING_CANCER = (
     r"C:\Users\taqio\OneDrive\Desktop\CSE\Oxford Internship"
     r"\Oxford-Internship\new_simulator\kinematic_csv_outputs"
@@ -73,7 +75,7 @@ NONKILLING_TCELL = (
 OUTPUT_DIR = r"kinematic_distribution_metrics"
 
 # =============================================================================
-# 2. FEATURE DEFINITIONS, CATEGORIES & COMPARISON MAPPINGS
+# 2. FEATURE DEFINITIONS, PHYSICAL UNITS, CATEGORIES & COMPARISONS
 # =============================================================================
 FEATURES = [
     "POSITION_X",
@@ -91,6 +93,23 @@ FEATURES = [
     "SPEED",
     "AVERAGE_SPEED",
 ]
+
+FEATURE_UNITS = {
+    "POSITION_X": "µm",
+    "POSITION_Y": "µm",
+    "DX_FROM_PREVIOUS_POINT": "µm",
+    "DY_FROM_PREVIOUS_POINT": "µm",
+    "DISPLACEMENT_FROM_PREVIOUS_POINT": "µm",
+    "DX_FROM_ORIGIN": "µm",
+    "DY_FROM_ORIGIN": "µm",
+    "DISPLACEMENT_FROM_ORIGIN": "µm",
+    "DISTANCE_TRAVELED": "µm",
+    "PATH_EFFICIENCY": "dimensionless",
+    "VEL_X": "µm/s",
+    "VEL_Y": "µm/s",
+    "SPEED": "µm/s",
+    "AVERAGE_SPEED": "µm/s",
+}
 
 CATEGORIES = {
     "Spatial Behavior": [
@@ -117,8 +136,7 @@ CATEGORIES = {
     ],
 }
 
-# Explicit dataset pair mapping (comp_name, exp_key, sim_key)
-# Guarantees zero ambiguity or key-mismatch
+# Explicit mapping of the 4 one-to-one regime comparisons
 COMPARISONS = [
     (
         "Experimental Killing Cancer vs Killing Cancer",
@@ -233,12 +251,12 @@ def calculate_jsd_raw(arr1, arr2, num_bins=100):
 
 
 # =============================================================================
-# 4. DATA LOADING AND SANITY VALIDATION
+# 4. DATA LOADING, FILTERING & SANITY VALIDATION
 # =============================================================================
-def load_and_validate_csv(filepath, description, chunksize=200_000):
+def load_and_validate_dataset(filepath, description, is_simulation=False, chunksize=200_000):
     """
-    Loads dataset in chunks, extracts feature arrays and track metadata,
-    and performs numeric validation checks.
+    Loads dataset in memory-efficient chunks. For simulation datasets, filters to
+    observation frames (FRAME % 6 == 0) to align with experimental frame sampling.
     """
     print(f" -> Loading [{description}] from:\n    {filepath}")
     if not os.path.exists(filepath):
@@ -248,6 +266,7 @@ def load_and_validate_csv(filepath, description, chunksize=200_000):
     feature_data = {f: [] for f in FEATURES}
     metadata = {
         "total_rows": 0,
+        "sampled_rows": 0,
         "unique_tracks": set(),
         "invalid_counts": {f: 0 for f in FEATURES},
         "path_eff_out_of_bounds": 0,
@@ -263,10 +282,17 @@ def load_and_validate_csv(filepath, description, chunksize=200_000):
                 track_col = col_name
                 break
 
-        read_cols = cols_present + ([track_col] if track_col else [])
+        read_cols = cols_present + (["FRAME"] if "FRAME" in preview.columns else [])
+        read_cols += ([track_col] if track_col and track_col not in read_cols else [])
 
         for chunk in pd.read_csv(filepath, usecols=read_cols, chunksize=chunksize):
             metadata["total_rows"] += len(chunk)
+
+            # Filter simulation datasets to observation frames AFTER kinetics calculation
+            if is_simulation and "FRAME" in chunk.columns:
+                chunk = chunk[chunk["FRAME"] % 6 == 0]
+
+            metadata["sampled_rows"] += len(chunk)
             if track_col and track_col in chunk.columns:
                 metadata["unique_tracks"].update(chunk[track_col].dropna().unique())
 
@@ -294,19 +320,15 @@ def load_and_validate_csv(filepath, description, chunksize=200_000):
 
         num_tracks = len(metadata["unique_tracks"])
         obs_per_track = (
-            metadata["total_rows"] / num_tracks if num_tracks > 0 else 0.0
+            metadata["sampled_rows"] / num_tracks if num_tracks > 0 else 0.0
         )
 
+        filter_note = f" (filtered from {metadata['total_rows']:,} full frames)" if is_simulation else ""
         print(
-            f"    Loaded {metadata['total_rows']:,} observations | "
+            f"    Loaded {metadata['sampled_rows']:,} analysis observations{filter_note} | "
             f"{num_tracks:,} unique tracks | "
             f"~{obs_per_track:.1f} obs/track"
         )
-        if metadata["path_eff_out_of_bounds"] > 0:
-            print(
-                f"    [NOTE] PATH_EFFICIENCY had {metadata['path_eff_out_of_bounds']:,} "
-                f"observations slightly outside [0, 1] (retained)."
-            )
 
         metadata["obs_per_track"] = obs_per_track
         return clean_data, metadata
@@ -337,7 +359,7 @@ def generate_heatmap(df, title, cbar_label, filename, output_dir, cmap="YlOrRd",
 
     plt.title(title, fontsize=14, fontweight="bold", pad=15)
     plt.ylabel("Kinematic Feature", fontsize=11, fontweight="bold")
-    plt.xlabel("Experimental vs Simulation Comparison", fontsize=11, fontweight="bold")
+    plt.xlabel("Regime Comparison", fontsize=11, fontweight="bold")
     plt.xticks(rotation=15, ha="right", fontsize=9.5)
     plt.yticks(rotation=0, fontsize=9.5)
     plt.tight_layout()
@@ -360,32 +382,31 @@ def main():
     print(f"Output Directory: {os.path.abspath(OUTPUT_DIR)}\n")
 
     # Step 1: Load All 8 Datasets
-    print("--- STEP 1: LOADING & VALIDATING ALL 8 DATASETS ---")
+    print("--- STEP 1: LOADING & FILTERING ALL 8 DATASETS ---")
     datasets = {}
     metadata_summary = {}
 
     dataset_paths = [
-        ("Experimental Killing Cancer", EXPERIMENTAL_KILLING_CANCER),
-        ("Experimental Non-Killing Cancer", EXPERIMENTAL_NONKILLING_CANCER),
-        ("Experimental Killing T-Cell", EXPERIMENTAL_KILLING_TCELL),
-        ("Experimental Non-Killing T-Cell", EXPERIMENTAL_NONKILLING_TCELL),
-        ("Killing Cancer", KILLING_CANCER),
-        ("Killing T-Cell", KILLING_TCELL),
-        ("Non-Killing Cancer", NONKILLING_CANCER),
-        ("Non-Killing T-Cell", NONKILLING_TCELL),
+        ("Experimental Killing Cancer", EXPERIMENTAL_KILLING_CANCER, False),
+        ("Experimental Non-Killing Cancer", EXPERIMENTAL_NONKILLING_CANCER, False),
+        ("Experimental Killing T-Cell", EXPERIMENTAL_KILLING_TCELL, False),
+        ("Experimental Non-Killing T-Cell", EXPERIMENTAL_NONKILLING_TCELL, False),
+        ("Killing Cancer", KILLING_CANCER, True),
+        ("Killing T-Cell", KILLING_TCELL, True),
+        ("Non-Killing Cancer", NONKILLING_CANCER, True),
+        ("Non-Killing T-Cell", NONKILLING_TCELL, True),
     ]
 
-    for name, path in dataset_paths:
-        data, meta = load_and_validate_csv(path, name)
+    for name, path, is_sim in dataset_paths:
+        data, meta = load_and_validate_dataset(path, name, is_simulation=is_sim)
         datasets[name] = data
         metadata_summary[name] = meta
 
-    # Step 1B: Explicit Validation & Array Equality Sanity Checks
+    # Step 1B: Validation & Array Sanity Checks
     print("\n--- DATASET MAPPING & EQUALITY SANITY CHECKS ---")
     for comp_name, exp_k, sim_k in COMPARISONS:
         print(f"  [MAP CHECK] {comp_name:<55} -> [{exp_k}] vs [{sim_k}]")
 
-    # Check for accidental array duplication across loaded datasets
     all_dataset_keys = list(datasets.keys())
     for i in range(len(all_dataset_keys)):
         for j in range(i + 1, len(all_dataset_keys)):
@@ -403,7 +424,7 @@ def main():
                     )
 
     # Step 2: Compute Raw and Experimental-Reference Standardized Metrics
-    print("\n--- STEP 2: CALCULATING METRICS (EXPERIMENTAL REFERENCE STANDARDIZATION) ---")
+    print("\n--- STEP 2: CALCULATING RAW AND EXPERIMENTAL-REFERENCE STANDARDIZED METRICS ---")
 
     raw_wass_df = pd.DataFrame(index=FEATURES, columns=COMPARISON_NAMES, dtype=float)
     raw_ks_df = pd.DataFrame(index=FEATURES, columns=COMPARISON_NAMES, dtype=float)
@@ -436,7 +457,7 @@ def main():
             e_median, e_iqr = float(np.median(e_arr)), float(stats.iqr(e_arr))
             s_median, s_iqr = float(np.median(s_arr)), float(stats.iqr(s_arr))
 
-            # --- B. Raw Unit Metrics ---
+            # --- B. Raw Physical-Unit Metrics ---
             w_raw = calculate_wasserstein(e_arr, s_arr)
             ks_stat_raw, ks_p_raw = calculate_ks_statistic(e_arr, s_arr)
             jsd_raw = calculate_jsd_raw(e_arr, s_arr)
@@ -446,16 +467,16 @@ def main():
             raw_ks_p_df.loc[feat, comp_name] = ks_p_raw
             raw_jsd_df.loc[feat, comp_name] = jsd_raw
 
-            # --- C. Experimental Reference Standardization ---
-            # The specific comparison's experimental dataset defines the reference coordinate frame
+            # --- C. Experimental-Reference Standardization ---
+            # Strictly use experimental mean and std for the specific comparison
             if e_std > 1e-12:
                 e_std_arr = (e_arr - e_mean) / e_std
                 s_std_arr = (s_arr - e_mean) / e_std
+                delta_z = float((s_mean - e_mean) / e_std)
             else:
                 e_std_arr = e_arr - e_mean
                 s_std_arr = s_arr - e_mean
-
-            std_mean_diff = float(np.mean(s_std_arr) - np.mean(e_std_arr))
+                delta_z = float(s_mean - e_mean)
 
             w_std = calculate_wasserstein(e_std_arr, s_std_arr)
             ks_stat_std, _ = calculate_ks_statistic(e_std_arr, s_std_arr)
@@ -468,6 +489,7 @@ def main():
             feature_stats_rows.append({
                 "Comparison": comp_name,
                 "Feature": feat,
+                "Units": FEATURE_UNITS[feat],
                 "Exp_Mean": e_mean,
                 "Exp_Std": e_std,
                 "Exp_Median": e_median,
@@ -476,7 +498,7 @@ def main():
                 "Sim_Std": s_std,
                 "Sim_Median": s_median,
                 "Sim_IQR": s_iqr,
-                "Std_Mean_Diff": std_mean_diff,
+                "Delta_Z": delta_z,
                 "Raw_Wasserstein": w_raw,
                 "Raw_KS": ks_stat_raw,
                 "Raw_JSD": jsd_raw,
@@ -488,7 +510,7 @@ def main():
     feature_stats_df = pd.DataFrame(feature_stats_rows)
 
     # Step 3: Compute Per-Metric Normalized Composite Scores
-    print("\n--- STEP 3: COMPUTING PER-METRIC NORMALIZED COMPOSITE SCORES ---")
+    print("\n--- STEP 3: COMPUTING STANDARDIZED DISTRIBUTIONAL DIFFERENCE SCORES ---")
 
     def min_max_norm_metric(df):
         min_v = df.values.min()
@@ -552,6 +574,7 @@ def main():
         sorted_feats = composite_df[comp].sort_values(ascending=True)
         comp_rank_df = pd.DataFrame({
             "Feature": sorted_feats.index,
+            "Units": [FEATURE_UNITS[f] for f in sorted_feats.index],
             "Composite_Score": sorted_feats.values,
             "Std_Wasserstein": std_wass_df.loc[sorted_feats.index, comp].values,
             "Std_KS": std_ks_df.loc[sorted_feats.index, comp].values,
@@ -618,7 +641,7 @@ def main():
     )
     generate_heatmap(
         composite_df,
-        "Normalized Composite Difference Score (1/3 W_std + 1/3 KS + 1/3 JSD)",
+        "Standardized Distributional Difference Score (1/3 W_std + 1/3 KS + 1/3 JSD)",
         "Composite Score (0=Best, 1=Worst)",
         "composite_heatmap.png",
         OUTPUT_DIR,
@@ -652,7 +675,7 @@ def main():
 
 
 # =============================================================================
-# 7. MARKDOWN REPORT GENERATOR (DYNAMICALLY POPULATED & SYNTAX SAFE)
+# 7. MARKDOWN REPORT GENERATOR (DYNAMICALLY POPULATED)
 # =============================================================================
 def write_markdown_report(
     filepath,
@@ -685,12 +708,42 @@ def write_markdown_report(
 
     dataset_rows = ""
     for name, meta in metadata_summary.items():
-        num_obs = meta["total_rows"]
+        num_obs = meta["sampled_rows"]
         num_tr = len(meta["unique_tracks"])
         o_per_t = meta["obs_per_track"]
         dataset_rows += f"| {name} | {num_obs:,} | {num_tr:,} | {o_per_t:.1f} |\n"
 
-    failure_modes_text = ""
+    # Physical Realism Diagnostics: Largest raw discrepancies per comparison
+    raw_diag_text = ""
+    for comp_name in COMPARISON_NAMES:
+        c_stats = feature_stats_df[feature_stats_df["Comparison"] == comp_name]
+        
+        # Positional / displacement (µm)
+        um_feats = c_stats[c_stats["Units"] == "µm"]
+        max_w_um = um_feats.sort_values("Raw_Wasserstein", ascending=False).iloc[0]
+        
+        # Velocity / speed (µm/s)
+        vel_feats = c_stats[c_stats["Units"] == "µm/s"]
+        max_w_vel = vel_feats.sort_values("Raw_Wasserstein", ascending=False).iloc[0]
+        
+        # Specific key metrics
+        dist_row = c_stats[c_stats["Feature"] == "DISTANCE_TRAVELED"].iloc[0]
+        disp_orig_row = c_stats[c_stats["Feature"] == "DISPLACEMENT_FROM_ORIGIN"].iloc[0]
+
+        raw_diag_text += (
+            f"### {comp_name}\n"
+            f"- **Largest Spatial Discrepancy (Wasserstein)**: `{max_w_um['Feature']}` with **{max_w_um['Raw_Wasserstein']:.3f} µm** difference "
+            f"(Exp Mean: {max_w_um['Exp_Mean']:.3f} µm vs Sim Mean: {max_w_um['Sim_Mean']:.3f} µm).\n"
+            f"- **Largest Velocity/Speed Discrepancy (Wasserstein)**: `{max_w_vel['Feature']}` with **{max_w_vel['Raw_Wasserstein']:.3f} µm/s** difference "
+            f"(Exp Mean: {max_w_vel['Exp_Mean']:.3f} µm/s vs Sim Mean: {max_w_vel['Sim_Mean']:.3f} µm/s).\n"
+            f"- **Distance Traveled Discrepancy**: Raw Wasserstein = **{dist_row['Raw_Wasserstein']:.3f} µm** "
+            f"(Exp Mean: {dist_row['Exp_Mean']:.3f} µm, Sim Mean: {dist_row['Sim_Mean']:.3f} µm).\n"
+            f"- **Displacement from Origin Discrepancy**: Raw Wasserstein = **{disp_orig_row['Raw_Wasserstein']:.3f} µm** "
+            f"(Exp Mean: {disp_orig_row['Exp_Mean']:.3f} µm, Sim Mean: {disp_orig_row['Sim_Mean']:.3f} µm).\n\n"
+        )
+
+    # Standardized diagnostics text
+    std_diag_text = ""
     for idx, (feat_name, comp_score) in enumerate(top_worst_feats.items(), start=1):
         feat_rows = feature_stats_df[feature_stats_df["Feature"] == feat_name]
         worst_row = feat_rows.loc[
@@ -698,19 +751,19 @@ def write_markdown_report(
         ].iloc[0]
 
         comp_with_worst = worst_row["Comparison"]
-        mean_diff = worst_row["Std_Mean_Diff"]
+        delta_z = worst_row["Delta_Z"]
         w_s = worst_row["Std_Wasserstein"]
         ks_s = worst_row["Std_KS"]
+        jsd_s = worst_row["Std_JSD"]
 
-        failure_modes_text += (
-            f"{idx}. **`{feat_name}`** (Mean Composite Score = **{comp_score:.3f}**)\n"
-            f"   - *Worst Comparison Pair*: `{comp_with_worst}`\n"
-            f"   - *Statistical Profile*: Standardized Mean Shift = **{mean_diff:+.3f} SD** | "
-            f"W1 = **{w_s:.3f} SD** | KS Stat = **{ks_s:.3f}**\n"
-            f"   - *Observed Shift*: Exp Mean = **{worst_row['Exp_Mean']:.3f}**, Sim Mean = **{worst_row['Sim_Mean']:.3f}** "
-            f"(Exp Median = **{worst_row['Exp_Median']:.3f}**, Sim Median = **{worst_row['Sim_Median']:.3f}**).\n"
-            f"   - *Diagnostic Interpretation*: Standardized mean shift of {mean_diff:+.3f} SD suggests "
-            f"potential location shift or tail expansion in simulation.\n\n"
+        std_diag_text += (
+            f"{idx}. **`{feat_name}`** ({worst_row['Units']}) — Mean Composite Score = **{comp_score:.3f}**\n"
+            f"   - *Worst Comparison Regime*: `{comp_with_worst}`\n"
+            f"   - *Diagnostic Profile*: Delta_Z = **{delta_z:+.3f} σ_exp** | W1 = **{w_s:.3f} σ_exp** | KS Stat = **{ks_s:.3f}** | JSD = **{jsd_s:.3f} bits**\n"
+            f"   - *Physical Values*: Exp Mean = **{worst_row['Exp_Mean']:.3f} {worst_row['Units']}**, Sim Mean = **{worst_row['Sim_Mean']:.3f} {worst_row['Units']}** "
+            f"(Exp Median = {worst_row['Exp_Median']:.3f}, Sim Median = {worst_row['Sim_Median']:.3f}).\n"
+            f"   - *Diagnostic Interpretation*: Standardized shift of {delta_z:+.3f} σ_exp relative to experimental variability "
+            f"indicates candidate area for simulator calibration.\n\n"
         )
 
     rankings_text = ""
@@ -720,7 +773,9 @@ def write_markdown_report(
             [
                 "Rank",
                 "Feature",
+                "Units",
                 "Composite_Score",
+                "Raw_Wasserstein",
                 "Std_Wasserstein",
                 "Std_KS",
                 "Std_JSD",
@@ -731,57 +786,65 @@ def write_markdown_report(
     report_content = f"""# Quantitative Kinematic Distribution Similarity Report
 
 ## 1. Executive Summary
-This report provides an unbiased, quantitative assessment comparing experimental live-cell tracking distributions against GPU-accelerated PyTorch simulation outputs across **14 kinematic features** and **4 regime-matched, one-to-one experimental-vs-simulation comparisons**.
+This report provides an unbiased, quantitative assessment comparing 4 regime-matched experimental live-cell tracking datasets against GPU simulation trajectories sampled at identical observational frames (`FRAME % 6 == 0`).
 
-Mathematical similarity is evaluated using **1st Wasserstein Distance (W1)**, **Two-Sample Kolmogorov-Smirnov Statistics (KS)**, and **Jensen-Shannon Divergence (JSD)**.
+Simulation kinematics represent instantaneous 1-frame transitions ($t$ vs $t-1$, $dt=1.0$) with physical units directly matching experimental microscopy tracking measurements:
+- **Positions, Displacements, Distances**: µm
+- **Velocities, Speeds**: µm/s
+- **Path Efficiency**: dimensionless
+
+Mathematical similarity is evaluated under two distinct perspectives:
+1. **Primary Analysis (Raw Physical Units)**: Quantifies the absolute physical discrepancy between experimental measurements and simulation outputs.
+2. **Secondary Diagnostic Analysis (Experimental Reference Z-Scores)**: Evaluates the discrepancy relative to the natural biological variability ($\sigma_{{\\text{{exp}}}}$) of the corresponding experimental condition.
 
 ### Dynamic Summary of Key Findings:
-- **Best Overall Comparison Agreement**: **{best_comp_name}** achieved the lowest overall composite difference index (**{best_comp_score:.3f}**).
-- **Worst Overall Comparison Agreement**: **{worst_comp_name}** exhibited the highest overall composite difference index (**{worst_comp_score:.3f}**).
+- **Best Overall Comparison Agreement**: **{best_comp_name}** achieved the lowest overall standardized distributional difference index (**{best_comp_score:.3f}**).
+- **Worst Overall Comparison Agreement**: **{worst_comp_name}** exhibited the highest overall standardized distributional difference index (**{worst_comp_score:.3f}**).
 - **Most Accurately Reproduced Category**: **{best_cat_name}** across all regimes (Mean Category Composite Score = **{best_cat_score:.3f}**).
 - **Least Accurately Reproduced Category**: **{worst_cat_name}** across all regimes (Mean Category Composite Score = **{worst_cat_score:.3f}**).
-- **Primary Diagnostic Target**: Top feature mismatches are led by `{top_worst_feats.index[0]}` (Mean Composite = **{top_worst_feats.iloc[0]:.3f}**) and `{top_worst_feats.index[1]}` (Mean Composite = **{top_worst_feats.iloc[1]:.3f}**).
+- **Primary Diagnostic Targets**: Top feature mismatches are led by `{top_worst_feats.index[0]}` (Mean Composite = **{top_worst_feats.iloc[0]:.3f}**) and `{top_worst_feats.index[1]}` (Mean Composite = **{top_worst_feats.iloc[1]:.3f}**).
 
 ---
 
 ## 2. Dataset Information and Observational Metadata
-The dataset consists of repeated observations recorded across individual cell tracks (`TRACK_ID`) across 4 distinct experimental datasets and 4 corresponding simulation output files.
+The dataset consists of observations recorded across individual cell tracks (`TRACK_ID`) across 4 distinct experimental datasets and 4 corresponding simulation output files (filtered at `FRAME % 6 == 0`).
 
-| Dataset Description | Observations | Unique Tracks | Obs / Track |
+| Dataset Description | Analyzed Observations | Unique Tracks | Obs / Track |
 | :--- | :--- | :--- | :--- |
 {dataset_rows}
 ### Observational Structure & Statistical Autocorrelation
-Sequential frame observations within an individual cell trajectory exhibit temporal autocorrelation and are not independent biological replicates. Conventional hypothesis-testing p-values scale with sample size (N > 10^5), evaluating to p < 1e-300. 
+Sequential frame observations within an individual cell trajectory exhibit temporal autocorrelation and are not independent biological replicates. Conventional hypothesis-testing p-values scale with sample size ($N > 10^5$), evaluating to $p < 1\\times 10^{{-300}}$. 
 **Methodological Safeguard**: Because trajectory observations are temporally correlated and therefore not independent, KS p-values should not be interpreted as conventional hypothesis-test evidence of biological significance or non-equivalence. The KS statistic is retained purely as a descriptive empirical CDF distance.
 
 ---
 
 ## 3. Statistical Methodology & Metric Definitions
 
-### A. Regime-Specific Experimental Reference Standardization
-To prevent simulation scale mismatches or variance from distorting the target coordinate frame, standardization is performed using **strictly the experimental baseline parameters of that specific comparison** (Mean_exp, Std_exp) independently for each feature:
+### A. Raw Physical-Unit Evaluation (Primary Analysis)
+Because the simulator output and experimental tracking datasets use identical physical units (µm, µm/s), raw metrics directly evaluate physical realism without scaling:
+- **Raw Wasserstein ($W_1$)**: Minimal work required to transform the simulation distribution into the experimental distribution, retaining the feature's physical unit (µm, µm/s).
+- **Raw Two-Sample KS ($D_{{\\text{{KS}}}}$)**: Maximum absolute vertical distance between empirical CDFs. Bounded $[0, 1]$.
+- **Raw JSD**: Symmetrical Jensen-Shannon Divergence in bits ($\log_2$) computed over common empirical support. Bounded $[0, 1]$ bits.
 
-z_exp = (x_exp - Mean_exp) / Std_exp
-z_sim = (x_sim - Mean_exp) / Std_exp
+### B. Experimental-Reference Z-Score Standardization (Secondary Diagnostic)
+To assess how large simulation discrepancies are relative to biological variability, standardization is performed using **strictly the experimental baseline parameters of that specific comparison** ($\mu_{{\\text{{exp}}}}$, $\sigma_{{\\text{{exp}}}}$):
 
-Standardized Wasserstein distance (W1) represents distributional separation measured directly in units of that condition's experimental standard deviation.
+$$z_{{\\text{{exp}}}} = \\frac{{x_{{\\text{{exp}}}} - \\mu_{{\\text{{exp}}}}}}{{\\sigma_{{\\text{{exp}}}}}}, \\quad z_{{\\text{{sim}}}} = \\frac{{x_{{\\text{{sim}}}} - \\mu_{{\\text{{exp}}}}}}{{\\sigma_{{\\text{{exp}}}}}}$$
 
-### B. Metric Definitions
-1. **Wasserstein Distance (W1)**: Sample-based 1st Wasserstein distance (Earth Mover's Distance). Measures minimal work required to transform one empirical sample distribution into another. Bounded [0, inf), lower is better.
-2. **Kolmogorov-Smirnov Statistic (KS)**: Sample-based two-sample KS statistic. Measures peak empirical CDF divergence. Bounded [0, 1], lower is better.
-3. **Jensen-Shannon Divergence (JSD)**: Density-based information-theoretic divergence calculated in bits (log2) over standardized z-space support [-10, +10] with 200 bins. Bounded [0, 1] bits, lower is better.
+- **Delta_Z (Diagnostic Effect Size)**: $\\Delta Z = (\\mu_{{\\text{{sim}}}} - \\mu_{{\\text{{exp}}}}) / \\sigma_{{\\text{{exp}}}}$. Represents the mean shift in units of experimental standard deviations.
+- **Standardized Wasserstein ($W_1$)**: Distributional distance expressed in $\\sigma_{{\\text{{exp}}}}$ units.
 
-### C. Equal-Weighted Composite Score & Category Aggregation
-Per-metric Min-Max normalization maps W1, KS, and JSD to [0, 1]. The Composite Difference Index is:
+### C. Standardized Distributional Difference Score (Composite)
+Per-metric Min-Max normalization maps standardized $W_1$, $D_{{\\text{{KS}}}}$, and $\\text{{JSD}}$ to $[0, 1]$. The Composite Difference Index is:
 
-Composite Score = (1/3) * Norm_W1 + (1/3) * Norm_KS + (1/3) * Norm_JSD
+$$\\text{{Composite Score}} = \\frac{{1}}{{3}} \\tilde{{W}}_{{\\text{{std}}}} + \\frac{{1}}{{3}} \\tilde{{D}}_{{\\text{{KS}}}} + \\frac{{1}}{{3}} \\tilde{{\\text{{JSD}}}}$$
 
-Category Scores are calculated as the unweighted arithmetic mean of feature-level composite scores within each category. Lower scores indicate superior agreement.
+This is a diagnostic ranking metric where lower scores indicate greater distributional agreement. It does not represent a biological significance test or physical realism score.
 
 ---
 
 ## 4. Overall Comparison-Level Summary
-Lower composite scores indicate superior distributional alignment with experimental data.
+Lower composite scores indicate superior distributional alignment with experimental target data.
 
 {comp_summary_df.to_markdown(index=False)}
 
@@ -794,78 +857,85 @@ Mean composite scores by behavioral category (0 = Identical, 1 = Maximum Diverge
 
 ---
 
-## 6. Feature Rankings by Comparison (Best Match to Worst Match)
+## 6. Primary Physical Realism Diagnostics (Raw Physical Units)
+Key absolute physical discrepancies between experimental and simulation distributions:
+
+{raw_diag_text}
+
+---
+
+## 7. Secondary Diagnostic Analysis (Largest Standardized Discrepancies)
+Candidate features for simulator calibration based on standardized divergence from experimental variability:
+
+{std_diag_text}
+
+---
+
+## 8. Feature Rankings by Comparison (Best Match to Worst Match)
 {rankings_text}
 
 ---
 
-## 7. Raw Physical Unit Metric Tables
+## 9. Raw Physical Unit Metric Tables
 
-### Raw Wasserstein Distance (W1 in physical units)
+### Raw Wasserstein Distance ($W_1$ in physical units)
 {raw_wass.to_markdown()}
 
-### Raw Kolmogorov-Smirnov Statistic (KS Stat)
+### Raw Kolmogorov-Smirnov Statistic ($D_{{\\text{{KS}}}}$)
 {raw_ks.to_markdown()}
 
-### Raw Jensen-Shannon Divergence (JSD in bits)
+### Raw Jensen-Shannon Divergence ($\\text{{JSD}}$ in bits)
 {raw_jsd.to_markdown()}
 
 ---
 
-## 8. Experimental Reference Standardized Z-Score Tables
+## 10. Experimental Reference Standardized Z-Score Tables
 
-### Standardized Wasserstein Distance (W1 in Experimental Std units)
+### Standardized Wasserstein Distance ($W_1$ in $\\sigma_{{\\text{{exp}}}}$ units)
 {std_wass.to_markdown()}
 
-### Standardized Kolmogorov-Smirnov Statistic (KS Stat)
+### Standardized Kolmogorov-Smirnov Statistic ($D_{{\\text{{KS}}}}$)
 {std_ks.to_markdown()}
 
-### Standardized Jensen-Shannon Divergence (JSD in bits)
+### Standardized Jensen-Shannon Divergence ($\\text{{JSD}}$ in bits)
 {std_jsd.to_markdown()}
 
 ---
 
-## 9. Dynamic Feature Mismatch Diagnostics (Top 5 Priority Failure Modes)
-The top 5 feature mismatches ranked by cross-comparison mean composite score are:
-
-{failure_modes_text}
-
----
-
-## 10. Local Kinematics vs. Global Trajectory Discrepancies
+## 11. Local Kinematics vs. Global Trajectory Discrepancies
 Comparing local kinematic features (`VEL_X`, `VEL_Y`, `SPEED`, `DX/DY_FROM_PREVIOUS_POINT`) against long-term spatial trajectory features (`DISPLACEMENT_FROM_ORIGIN`, `DISTANCE_TRAVELED`, `DX/DY_FROM_ORIGIN`) highlights a structural dichotomy:
 
 - **Local Kinematics Category Score**: **{category_df.loc["Velocity"].mean():.3f}** (Velocity) | **{category_df.loc["Local Motility"].mean():.3f}** (Local Motility).
 - **Global Trajectory Category Score**: **{category_df.loc["Spatial Behavior"].mean():.3f}** (Spatial Behavior) | **{category_df.loc["Long-Term Motility"].mean():.3f}** (Long-Term Motility).
 
-**Diagnostic Insight**: The simulator reproduces local instantaneous velocity vectors with relatively higher fidelity, but integrated positional errors accumulate over long temporal horizons (t > 50 frames), leading to spatial dispersion mismatches.
+**Diagnostic Insight**: The simulator reproduces local instantaneous velocity vectors with relatively higher physical fidelity, but integrated positional errors accumulate over long temporal horizons ($t > 50$ frames), leading to spatial dispersion mismatches.
 
 ---
 
-## 11. Observed Mismatches, Mechanistic Explanations, & Candidate Parameters
+## 12. Candidate Simulator Parameters for Future Calibration
 
-The statistical analysis establishes **distributional non-equivalence** (P_exp != P_sim). The parameter associations below represent **candidate mechanisms for future experimental calibration**, not established causal proofs.
+The statistical analysis establishes **distributional non-equivalence** ($P_{{\\text{{exp}}}} \\neq P_{{\\text{{sim}}}}$). The parameter associations below represent **candidate mechanisms for future experimental calibration**, not established causal proofs.
 
-| Observed Distributional Mismatch | Potential Mechanistic Explanation | Candidate Simulator Parameters to Investigate |
+| Observed Physical / Standardized Mismatch | Potential Mechanistic Explanation | Candidate Simulator Parameters to Investigate |
 | :--- | :--- | :--- |
-| **Excessive `DISPLACEMENT_FROM_ORIGIN`** | Simulated cells wander unconstrained across the domain; missing spatial anchoring. | `tau` (steering persistence), `max_speed`, `CAN_EVASIVE_SPEED`, boundary/tethering forces. |
-| **High Cumulative `DISTANCE_TRAVELED`** | Continuous uninhibited motion with minimal resting phases. | `ENERGY_DRAIN_MOVE`, `ENERGY_RECOVER_REST`, `noise_scale`, phenotype speed multipliers (`SPEED_MULTS`). |
+| **Excessive `DISPLACEMENT_FROM_ORIGIN` (µm)** | Simulated cells wander unconstrained across domain; missing spatial confinement. | `tau` (steering persistence), `max_speed`, `CAN_EVASIVE_SPEED`, boundary/tethering forces. |
+| **High Cumulative `DISTANCE_TRAVELED` (µm)** | Continuous uninhibited motion with minimal resting phases. | `ENERGY_DRAIN_MOVE`, `ENERGY_RECOVER_REST`, `noise_scale`, phenotype speed multipliers (`SPEED_MULTS`). |
 | **Step Displacements (`DX/DY_PREVIOUS`) Heavy Tails** | Steering accelerations produce step overshooting at 6-frame sampling intervals. | `noise_scale`, `IMMUNE_BASE_MEAN`, `tau`, simulation integration timestep `dt`. |
 | **Path Efficiency Discrepancies in Non-Killing Mode** | Uninhibited random walks produce inefficient exploratory paths. | Non-killing baseline `tau`, `noise_scale`, chemotaxis weighting factors. |
 
 ---
 
-## 12. Methodological Limitations
-1. **Temporal Autocorrelation**: Frame-level observations within cell trajectories are time-dependent. KS statistics are descriptive.
-2. **Pragmatic Composite Index**: The Composite Score is a normalized, equal-weighted diagnostic index (w1=1/3, w2=1/3, w3=1/3), not a universal physical constant.
-3. **Observational Frame Equivalence**: Simulation metrics are computed at 6-frame intervals (dt_obs = 6.0) to match microscopy sampling, but camera tracking artifacts in experimental data are not explicitly modeled.
+## 13. Methodological Limitations
+1. **Temporal Autocorrelation**: Frame-level observations within cell trajectories are time-dependent. KS statistics and p-values are descriptive.
+2. **Diagnostic Composite Index**: The Composite Score is a normalized, equal-weighted diagnostic index ($w_1=1/3, w_2=1/3, w_3=1/3$), not a universal physical constant.
+3. **Observational Frame Equivalence**: Simulation metrics are computed from continuous 1-frame integration ($dt=1.0$) and sampled at observation frames (`FRAME % 6 == 0`), matching microscopy sampling.
 
 ---
 
-## 13. Final Conclusions
-1. The analysis provides an **unbiased diagnostic baseline** without tuning metrics to artificially improve model scores.
-2. **Velocity components and instantaneous speed** exhibit the strongest distributional alignment with experimental live-cell tracking.
-3. **Global spatial trajectory features** (`DISPLACEMENT_FROM_ORIGIN`, `DISTANCE_TRAVELED`) represent the primary targets for parameter calibration prior to downstream machine learning integration.
+## 14. Final Conclusions
+1. The analysis provides an **unbiased diagnostic baseline** without altering physical units or masking discrepancies.
+2. **Velocity components and instantaneous speed** exhibit the strongest physical alignment with experimental live-cell tracking.
+3. **Global spatial trajectory features** (`DISPLACEMENT_FROM_ORIGIN`, `DISTANCE_TRAVELED`) represent the primary physical targets for parameter calibration.
 """
 
     with open(filepath, "w", encoding="utf-8") as f:

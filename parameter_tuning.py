@@ -1,28 +1,119 @@
 """
-new_cell_simulator.py (v9.0 — Consecutive-Frame Kinematic Architecture)
-============================================================================
-GPU-accelerated PyTorch immune-cancer microenvironment simulator.
-Simulates and exports the COMPLETE internal trajectory (0, 1, 2, 3, ..., 8634).
-Computes instantaneous kinematics from consecutive frames (t vs t-1) using dt=1.0.
-
-CSV OUTPUT FORMAT (16 COLUMNS):
-TRACK_ID, FRAME, POSITION_X, POSITION_Y, DX_FROM_PREVIOUS_POINT,
-DY_FROM_PREVIOUS_POINT, DISPLACEMENT_FROM_PREVIOUS_POINT, DX_FROM_ORIGIN,
-DY_FROM_ORIGIN, DISPLACEMENT_FROM_ORIGIN, DISTANCE_TRAVELED, PATH_EFFICIENCY,
-VEL_X, VEL_Y, SPEED, AVERAGE_SPEED
+parameter_tuning.py
+================================================================================
+Visual & Concise Numerical Parameter-Sweep Pipeline for Cell Kinematics
+--------------------------------------------------------------------------------
+1. Executes GPU simulation across parameter sweeps (supports scalars & tuples).
+2. Generates 4 14-feature raw physical histograms + 1 summary overview per run.
+3. Exports a concise 10-metric CSV (raw_metrics_summary.csv) per parameter setting:
+     - Exp Mean, Sim Mean, Abs Mean Diff
+     - Exp Median, Sim Median, Abs Median Diff
+     - Exp Std, Sim Std, Abs Std Diff
+     - Raw Wasserstein Distance, Two-Sample KS Statistic
+================================================================================
 """
 
 import os
-# Prevent CUDA memory fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import math
+import argparse
 import numpy as np
 import pandas as pd
+import scipy.stats as stats
 import torch
+import matplotlib.pyplot as plt
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# =============================================================================
+# 1. USER CONFIGURATION (SET YOUR PARAMETERS HERE)
+# =============================================================================
+
+# Name of the simulator parameter to tune:
+# Examples: "tau", "noise_scale", "IMMUNE_BASE_MEAN", "CAN_EVASIVE_SPEED", "max_speed"
+TUNING_PARAMETER = "KILL_RADIUS"
+
+# Range tuples [(min, max), ...] OR scalar values [val1, val2, ...]
+TUNING_VALUES = [2.5]
+
+# Random seed for fair stochastic comparison across parameter iterations
+RANDOM_SEED = 42
+
+# Root output directory
+BASE_OUTPUT_DIR = r"parameter_tuning"
+
+
+# =============================================================================
+# 2. EXPERIMENTAL DATASETS & 14 KINEMATIC FEATURES
+# =============================================================================
+EXPERIMENTAL_KILLING_CANCER = (
+    r"C:\Users\taqio\OneDrive\Desktop\CSE\Oxford Internship"
+    r"\Oxford-Internship\Cyto_Cancer Cell Kinematics.csv"
+)
+
+EXPERIMENTAL_KILLING_TCELL = (
+    r"C:\Users\taqio\OneDrive\Desktop\CSE\Oxford Internship"
+    r"\Oxford-Internship\Cyto_T-Cell Kinematics.csv"
+)
+
+EXPERIMENTAL_NONKILLING_CANCER = (
+    r"C:\Users\taqio\OneDrive\Desktop\CSE\Oxford Internship"
+    r"\Oxford-Internship\Wt_Cancer Cell Kinematics.csv"
+)
+
+EXPERIMENTAL_NONKILLING_TCELL = (
+    r"C:\Users\taqio\OneDrive\Desktop\CSE\Oxford Internship"
+    r"\Oxford-Internship\Wt_T-Cell Kinematics.csv"
+)
+
+KINEMATIC_COLUMNS = [
+    "POSITION_X",
+    "POSITION_Y",
+    "DX_FROM_PREVIOUS_POINT",
+    "DY_FROM_PREVIOUS_POINT",
+    "DISPLACEMENT_FROM_PREVIOUS_POINT",
+    "DX_FROM_ORIGIN",
+    "DY_FROM_ORIGIN",
+    "DISPLACEMENT_FROM_ORIGIN",
+    "DISTANCE_TRAVELED",
+    "PATH_EFFICIENCY",
+    "VEL_X",
+    "VEL_Y",
+    "SPEED",
+    "AVERAGE_SPEED",
+]
+
+FEATURE_UNITS = {
+    "POSITION_X": "µm",
+    "POSITION_Y": "µm",
+    "DX_FROM_PREVIOUS_POINT": "µm",
+    "DY_FROM_PREVIOUS_POINT": "µm",
+    "DISPLACEMENT_FROM_PREVIOUS_POINT": "µm",
+    "DX_FROM_ORIGIN": "µm",
+    "DY_FROM_ORIGIN": "µm",
+    "DISPLACEMENT_FROM_ORIGIN": "µm",
+    "DISTANCE_TRAVELED": "µm",
+    "PATH_EFFICIENCY": "dimensionless",
+    "VEL_X": "µm/s",
+    "VEL_Y": "µm/s",
+    "SPEED": "µm/s",
+    "AVERAGE_SPEED": "µm/s",
+}
+
+NON_NEGATIVE_FEATURES = [
+    "DISPLACEMENT_FROM_PREVIOUS_POINT",
+    "DISPLACEMENT_FROM_ORIGIN",
+    "DISTANCE_TRAVELED",
+    "PATH_EFFICIENCY",
+    "SPEED",
+    "AVERAGE_SPEED",
+]
+
+
+# =============================================================================
+# 3. CELL SIMULATOR ENGINE (PyTorch GPU)
+# =============================================================================
 _NEIGHBOR_OFFSETS = [(-1, -1), (-1, 0), (-1, 1),
                      (0, -1),  (0, 0),  (0, 1),
                      (1, -1),  (1, 0),  (1, 1)]
@@ -34,9 +125,9 @@ def _sample_uniform(lo, hi, n, generator, device):
 
 class CellSimulation:
     def __init__(self,
-                 num_immune=1000, num_cancer=1000,
+                 num_immune=100, num_cancer=100,
                  width=1536.0, height=1536.0,
-                 timesteps=8635,             # Frames 0 to 8634 inclusive
+                 timesteps=8635,
                  mode='killing',
                  dt=1.0,
                  seed=None,
@@ -44,13 +135,7 @@ class CellSimulation:
                  max_per_cell=16,
                  max_signals_per_cell=32,
                  device=None,
-                 debug=False,
-                 scout_prob=0.30,
-                 messenger_prob=0.30,
-                 killer_prob=0.40,
-                 target_lock_timeout=15,
-                 enable_proliferation=False,
-                 enable_apoptosis=False):
+                 param_override=None):
 
         self.device = device if device is not None else DEVICE
         self.gen = torch.Generator(device=self.device)
@@ -65,25 +150,17 @@ class CellSimulation:
         self.timesteps = timesteps
         self.dt = dt
         self.mode = mode
-        self.debug = debug
         self.max_per_cell = max_per_cell
         self.max_signals_per_cell = max_signals_per_cell
+        self.param_override = param_override if param_override is not None else {}
 
-        # Auto-scale simulation domain to maintain density
-        if width is None or height is None:
-            side = math.sqrt(N / target_density)
-            width = width if width is not None else side
-            height = height if height is not None else side
         self.width = float(width)
         self.height = float(height)
 
-        self.scout_prob = scout_prob
-        self.messenger_prob = messenger_prob
-        self.killer_prob = killer_prob
-        self.target_lock_timeout = target_lock_timeout
-        
-        self.enable_proliferation = False
-        self.enable_apoptosis = False
+        self.scout_prob = 0.30
+        self.messenger_prob = 0.30
+        self.killer_prob = 0.40
+        self.target_lock_timeout = 15
 
         self._initialize_constants()
         self._initialize_phenotypes()
@@ -97,7 +174,6 @@ class CellSimulation:
         return torch.where(mask, _sample_uniform(lo, hi, self.num_cells, self.gen, self.device), base)
 
     def _initialize_constants(self):
-        """Centralized Biological Configuration & Hyperparameters."""
         if self.mode == 'killing':
             self.IMMUNE_BASE_MEAN, self.IMMUNE_BASE_STD = 5.0, 1.6
             self.RECOG_BASE = (0.85, 0.60, 0.95)
@@ -145,18 +221,14 @@ class CellSimulation:
         self.ENERGY_RECOVER_REST = 0.015
         self.ENERGY_EMIT_THRESHOLD = 0.15
 
-        self.PROLIFERATION_PROB_BASE = 0.005
-        self.APOPTOSIS_PROB_IMMUNE = 0.0005
-        self.APOPTOSIS_PROB_CANCER = 0.0002
-
         self.ALIGNMENT_RADIUS_KILLER = 12.0
         self.ALIGNMENT_RADIUS_CANCER = 10.0
 
-    def _initialize_phenotypes(self):
-        prob_sum = self.scout_prob + self.messenger_prob + self.killer_prob
-        if not math.isclose(prob_sum, 1.0, abs_tol=1e-5):
-            raise ValueError(f"Immune phenotype probabilities must sum to 1.0 (got {prob_sum:.4f})")
+        for k, v in self.param_override.items():
+            if hasattr(self, k) and not isinstance(v, tuple):
+                setattr(self, k, float(v))
 
+    def _initialize_phenotypes(self):
         dev = self.device
         gen = self.gen
 
@@ -223,16 +295,34 @@ class CellSimulation:
                          torch.where(imm_msg, self.KILL_RATES[1],
                          torch.where(imm_killer, self.KILL_RATES[2], 0.0)))
 
-        self.tau = self._blend(imm_scout, 1.0, 2.0, z.clone())
-        self.tau = self._blend(imm_msg, 2.0, 3.5, self.tau)
-        self.tau = self._blend(imm_killer, 3.5, 5.0, self.tau)
-        self.tau = torch.where(self.is_cancer, _sample_uniform(2.0, 4.0, N, gen, dev), self.tau)
+        # Handle 'tau' parameter override or default assignment
+        if "tau" in self.param_override:
+            tau_val = self.param_override["tau"]
+            if isinstance(tau_val, tuple):
+                t_lo, t_hi = tau_val
+                self.tau = _sample_uniform(t_lo, t_hi, N, gen, dev)
+            else:
+                self.tau = torch.full((N,), float(tau_val), device=dev)
+        else:
+            self.tau = self._blend(imm_scout, 1.0, 2.0, z.clone())
+            self.tau = self._blend(imm_msg, 2.0, 3.5, self.tau)
+            self.tau = self._blend(imm_killer, 3.5, 5.0, self.tau)
+            self.tau = torch.where(self.is_cancer, _sample_uniform(2.0, 4.0, N, gen, dev), self.tau)
 
-        self.noise_scale = self._blend(imm_scout, 0.20, 0.30, z.clone())
-        self.noise_scale = self._blend(imm_msg, 0.10, 0.20, self.noise_scale)
-        self.noise_scale = self._blend(imm_killer, 0.01, 0.05, self.noise_scale)
-        self.noise_scale = self._blend(can_sessile, 0.02, 0.06, self.noise_scale)
-        self.noise_scale = self._blend(can_evasive, 0.15, 0.35, self.noise_scale)
+        # Handle 'noise_scale' parameter override or default assignment
+        if "noise_scale" in self.param_override:
+            ns_val = self.param_override["noise_scale"]
+            if isinstance(ns_val, tuple):
+                ns_lo, ns_hi = ns_val
+                self.noise_scale = _sample_uniform(ns_lo, ns_hi, N, gen, dev)
+            else:
+                self.noise_scale = torch.full((N,), float(ns_val), device=dev)
+        else:
+            self.noise_scale = self._blend(imm_scout, 0.20, 0.30, z.clone())
+            self.noise_scale = self._blend(imm_msg, 0.10, 0.20, self.noise_scale)
+            self.noise_scale = self._blend(imm_killer, 0.01, 0.05, self.noise_scale)
+            self.noise_scale = self._blend(can_sessile, 0.02, 0.06, self.noise_scale)
+            self.noise_scale = self._blend(can_evasive, 0.15, 0.35, self.noise_scale)
 
     def _initialize_signals(self):
         dev = self.device
@@ -253,9 +343,8 @@ class CellSimulation:
         N = self.num_cells
         T = self.timesteps
 
-        # Persistent Track IDs
         immune_ids = torch.arange(1, self.num_immune + 1, dtype=torch.long, device=dev)
-        cancer_ids = torch.arange(1001, 1001 + self.num_cancer, dtype=torch.long, device=dev)
+        cancer_ids = torch.arange(101, 101 + self.num_cancer, dtype=torch.long, device=dev)
         self.track_id = torch.cat([immune_ids, cancer_ids])
 
         self.positions = torch.stack([
@@ -288,9 +377,6 @@ class CellSimulation:
         self.grid_h = max(1, int(math.ceil(self.height / self.cell_size)))
         self.num_grid_cells = self.grid_w * self.grid_h
 
-        # ============================================================
-        # FULL-FRAME KINEMATIC PREALLOCATED BUFFERS (0 to 8634)
-        # ============================================================
         self.recorded_active_mask = torch.zeros((N, T), dtype=torch.bool, device=dev)
         self.rec_pos_x = torch.zeros((N, T), device=dev)
         self.rec_pos_y = torch.zeros((N, T), device=dev)
@@ -310,17 +396,11 @@ class CellSimulation:
         self.initial_pos = self.positions.clone()
         self.cum_dist_traveled = torch.zeros(N, device=dev)
 
-        self.stats_immune_alive = np.zeros(self.timesteps, dtype=np.int32)
-        self.stats_cancer_alive = np.zeros(self.timesteps, dtype=np.int32)
-        self.stats_kills_phase1 = np.zeros(self.timesteps, dtype=np.int32)
-        self.stats_counterkills_phase2 = np.zeros(self.timesteps, dtype=np.int32)
-
     def build_spatial_grid(self):
         gx = torch.clamp((self.positions[:, 0] / self.cell_size).long(), 0, self.grid_w - 1)
         gy = torch.clamp((self.positions[:, 1] / self.cell_size).long(), 0, self.grid_h - 1)
         cell_id = gy * self.grid_w + gx
-        dummy_id = self.num_grid_cells
-        cell_id = torch.where(self.active_mask, cell_id, dummy_id)
+        cell_id = torch.where(self.active_mask, cell_id, self.num_grid_cells)
 
         order = torch.argsort(cell_id)
         sorted_cell_id = cell_id[order]
@@ -339,8 +419,7 @@ class CellSimulation:
         gx = torch.clamp((self.signal_pos[:, 0] / self.cell_size).long(), 0, self.grid_w - 1)
         gy = torch.clamp((self.signal_pos[:, 1] / self.cell_size).long(), 0, self.grid_h - 1)
         cell_id = gy * self.grid_w + gx
-        dummy_id = self.num_grid_cells
-        cell_id = torch.where(self.signal_active, cell_id, dummy_id)
+        cell_id = torch.where(self.signal_active, cell_id, self.num_grid_cells)
 
         order = torch.argsort(cell_id)
         sorted_cell_id = cell_id[order]
@@ -488,7 +567,6 @@ class CellSimulation:
 
         self.target_lost_timer = torch.where(tgt_valid & (~tgt_in_sensing), self.target_lost_timer + 1, torch.zeros_like(self.target_lost_timer))
         lock_expired = self.target_lost_timer > self.target_lock_timeout
-        
         tgt = torch.where(tgt_valid & (~lock_expired), tgt, -1)
 
         search_dist = dist_cancer.clone().masked_fill(~valid_detect, float('inf'))
@@ -522,7 +600,6 @@ class CellSimulation:
 
         sig_candidates, sig_dist, sig_diff = self.find_nearby_signals(gx, gy)
         sig_valid = (sig_dist <= self.SIGNAL_SENSING_RADIUS)
-        
         sig_weights = (self.signal_strength[sig_candidates.clamp(min=0)] / (sig_dist**2 + self.CHEMOTAXIS_EPSILON)).masked_fill(~sig_valid, 0.0)
         
         total_weight = sig_weights.sum(dim=1, keepdim=True) + 1e-6
@@ -534,7 +611,6 @@ class CellSimulation:
         desired_vel_signal = (weighted_signal_dirs / sig_dir_norm) * desired_speed.unsqueeze(1)
 
         max_sig_val, max_sig_idx = torch.max(sig_weights, dim=1)
-
         best_sig_particle = torch.gather(sig_candidates, 1, max_sig_idx.unsqueeze(1)).squeeze(1)
         best_sig_emitter_type = self.signal_emitter_type[best_sig_particle.clamp(min=0)]
         is_scout_signal = (best_sig_emitter_type == 0)
@@ -645,7 +721,6 @@ class CellSimulation:
         self.positions[:, 1] = torch.clamp(self.positions[:, 1], 0.0, self.height)
 
     def perform_killing_phase1_immune_attack(self, candidates, dist, t):
-        """Phase 1 Combat — Immune Cells Attack Target Cancer Cells."""
         dev = self.device
         cand_is_immune = self.is_immune[candidates.clamp(min=0)]
         dist_immune = dist.clone().masked_fill(~cand_is_immune, float('inf'))
@@ -670,9 +745,6 @@ class CellSimulation:
         self.active_mask = self.active_mask & (~killed_now)
         self.contact_timer = torch.where(killed_now, 0.0, self.contact_timer)
 
-        num_kills = int(killed_now.sum().item())
-        self.stats_kills_phase1[t] = num_kills
-
         if killed_now.any():
             dead_ids = torch.nonzero(killed_now, as_tuple=False).squeeze(1)
             is_targeting_dead = torch.isin(self.locked_target, dead_ids)
@@ -685,9 +757,7 @@ class CellSimulation:
             self.energy[attacker_ids] = torch.clamp(self.energy[attacker_ids] + 0.15, max=1.0)
 
     def perform_killing_phase2_cancer_counterattack(self, candidates, dist, t):
-        """Phase 2 Combat — Active Cancer Counterattacks Nearby Immune Cells."""
         dev = self.device
-        
         cand_is_immune = self.is_immune[candidates.clamp(min=0)]
         local_immune_pressure = (cand_is_immune & (dist < 8.0)).sum(dim=1).float()
 
@@ -718,15 +788,7 @@ class CellSimulation:
         self.active_mask = self.active_mask & (~immune_killed)
         self.immune_contact_timer = torch.where(immune_killed, 0.0, self.immune_contact_timer)
 
-        self.stats_counterkills_phase2[t] = int(immune_killed.sum().item())
-
-    # ============================================================
-    # CONSECUTIVE-FRAME KINEMATIC RECORDER (Every frame t from t-1)
-    # ============================================================
     def _write_frame(self, t):
-        self.stats_immune_alive[t] = int((self.is_immune & self.active_mask).sum().item())
-        self.stats_cancer_alive[t] = int((self.is_cancer & self.active_mask).sum().item())
-
         self.recorded_active_mask[:, t] = self.active_mask
 
         curr_pos_x = self.positions[:, 0]
@@ -736,7 +798,6 @@ class CellSimulation:
         self.rec_pos_y[:, t] = curr_pos_y
 
         if t == 0:
-            # Frame 0 Initial Conditions: previous-frame features are NaN
             self.rec_dx_prev[:, 0] = float('nan')
             self.rec_dy_prev[:, 0] = float('nan')
             self.rec_disp_prev[:, 0] = float('nan')
@@ -744,7 +805,6 @@ class CellSimulation:
             self.rec_vel_y[:, 0] = float('nan')
             self.rec_speed[:, 0] = float('nan')
             
-            # Cumulative initializations
             self.rec_dx_orig[:, 0] = 0.0
             self.rec_dy_orig[:, 0] = 0.0
             self.rec_disp_orig[:, 0] = 0.0
@@ -755,27 +815,22 @@ class CellSimulation:
             prev_x = self.rec_pos_x[:, t - 1]
             prev_y = self.rec_pos_y[:, t - 1]
 
-            # 1. Local/Instantaneous features computed from frame t-1 to t
             dx_prev = curr_pos_x - prev_x
             dy_prev = curr_pos_y - prev_y
             disp_prev = torch.sqrt(dx_prev**2 + dy_prev**2)
 
             vel_x_inst = dx_prev / (self.dt * 10.0)
             vel_y_inst = dy_prev / (self.dt * 10.0)
-            # Computed from the scaled velocities (or displacement / 10s):
             speed_inst = torch.sqrt(vel_x_inst**2 + vel_y_inst**2)
 
-            # 2. Cumulative path distance (sum of all consecutive step displacements)
             self.cum_dist_traveled += disp_prev
 
-            # 3. Displacement from origin (relative to frame 0)
             orig_x = self.initial_pos[:, 0]
             orig_y = self.initial_pos[:, 1]
             dx_orig = curr_pos_x - orig_x
             dy_orig = curr_pos_y - orig_y
             disp_orig = torch.sqrt(dx_orig**2 + dy_orig**2)
 
-            # 4. Path Efficiency (Origin Displacement / Cumulative Distance Traveled)
             path_eff = torch.where(
                 self.cum_dist_traveled > 1e-6,
                 disp_orig / self.cum_dist_traveled,
@@ -783,11 +838,9 @@ class CellSimulation:
             )
             path_eff = torch.clamp(path_eff, 0.0, 1.0)
 
-            # 5. Cumulative Average Speed (Distance Traveled / Elapsed Seconds)
             elapsed_seconds = float(t * self.dt * 10.0)
             avg_speed_val = self.cum_dist_traveled / elapsed_seconds
 
-            # Commit to GPU buffers
             self.rec_dx_prev[:, t] = dx_prev
             self.rec_dy_prev[:, t] = dy_prev
             self.rec_disp_prev[:, t] = disp_prev
@@ -815,10 +868,8 @@ class CellSimulation:
         self.resolve_collisions(candidates, valid, dist, diff)
         self.apply_boundary_forces()
 
-        # Phase 1: Immune Cell Attack
         self.perform_killing_phase1_immune_attack(candidates, dist, t)
 
-        # Phase 2: Re-query Neighbors & Execute Cancer Counterattack
         candidates_post1, _, dist_post1, _ = self.find_neighbors(cached_gx=gx, cached_gy=gy)
         self.perform_killing_phase2_cancer_counterattack(candidates_post1, dist_post1, t)
 
@@ -832,16 +883,7 @@ class CellSimulation:
                 if self.device.type == 'cuda' and t % 500 == 0:
                     torch.cuda.empty_cache()
 
-        stats = {
-            "immune_alive": self.stats_immune_alive,
-            "cancer_alive": self.stats_cancer_alive,
-            "kills_phase1": self.stats_kills_phase1,
-            "counterkills_phase2": self.stats_counterkills_phase2,
-        }
-        return stats
-
     def export_kinematics_csv(self, output_dir):
-        """Transfers full-frame GPU trajectory tensors to CPU and writes CSV files."""
         os.makedirs(output_dir, exist_ok=True)
         T = self.timesteps
 
@@ -869,10 +911,9 @@ class CellSimulation:
 
         for cell_idx in range(self.num_cells):
             t_id = track_ids[cell_idx]
-            is_immune_cell = (t_id <= 1000)
+            is_immune_cell = (t_id <= 100)
 
             for t_idx in range(T):
-                # Stop recording trajectory if cell has died
                 if not act_mask[cell_idx, t_idx]:
                     break
 
@@ -921,68 +962,313 @@ class CellSimulation:
         return tcell_filename, cancer_filename
 
 
-# ============================================================
-# DATASET GENERATION PIPELINE
-# ============================================================
-def generate_dataset(mode, run_id=0, num_immune=1000, num_cancer=1000, timesteps=8635,
-                      output_dir="new_simulator/kinematic_csv_outputs", **kwargs):
-    seed = hash((mode, run_id)) % (2**32)
-    sim = CellSimulation(num_immune=num_immune, num_cancer=num_cancer,
-                          timesteps=timesteps, mode=mode, seed=seed, **kwargs)
-    
-    summary_stats = sim.run_simulation()
-    tcell_csv, cancer_csv = sim.export_kinematics_csv(output_dir)
+# =============================================================================
+# 4. DATA LOADING & STRICT RAW PHYSICAL COMPARISON ENGINE
+# =============================================================================
+def load_dataset_cached(path, name, is_simulation=False, chunksize=200_000):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File does not exist: {path}")
 
-    print(f"\n============================================================")
-    print(f"Mode: {mode}")
-    print(f"Total internal simulation frames exported: {timesteps} (0 to {timesteps-1})")
-    print(f"Immune cells: {num_immune} (TRACK_IDs 1-1000)")
-    print(f"Cancer cells: {num_cancer} (TRACK_IDs 1001-2000)")
-    print(f"Output:")
-    print(f"    {tcell_csv}")
-    print(f"    {cancer_csv}")
-    print(f"============================================================\n")
-    return sim, tcell_csv, cancer_csv
+    preview = pd.read_csv(path, nrows=2)
+    cols_present = [col for col in KINEMATIC_COLUMNS if col in preview.columns]
+    read_cols = cols_present + (["FRAME"] if "FRAME" in preview.columns else [])
+    
+    chunks = []
+    for chunk in pd.read_csv(path, usecols=read_cols, chunksize=chunksize):
+        if is_simulation and "FRAME" in chunk.columns:
+            chunk = chunk[chunk["FRAME"] % 6 == 0]
+        chunks.append(chunk[cols_present])
+
+    return pd.concat(chunks, ignore_index=True)
+
+
+def clean_feature_array(df, feature):
+    values = pd.to_numeric(df[feature], errors="coerce").dropna().values
+    valid_mask = np.isfinite(values)
+    if feature in NON_NEGATIVE_FEATURES:
+        valid_mask = valid_mask & (values >= 0)
+    return values[valid_mask]
+
+
+def compute_raw_feature_metrics(exp_arr, sim_arr, feature, regime_name):
+    """Computes exact 10 concise raw metrics without any Z-scaling or normalization."""
+    if len(exp_arr) == 0 or len(sim_arr) == 0:
+        return None
+
+    e_mean, s_mean = float(np.mean(exp_arr)), float(np.mean(sim_arr))
+    e_med, s_med = float(np.median(exp_arr)), float(np.median(sim_arr))
+    e_std, s_std = float(np.std(exp_arr)), float(np.std(sim_arr))
+
+    w_dist = float(stats.wasserstein_distance(exp_arr, sim_arr))
+    ks_stat = float(stats.ks_2samp(exp_arr, sim_arr).statistic)
+
+    return {
+        "Regime": regime_name,
+        "Feature": feature,
+        "Units": FEATURE_UNITS[feature],
+        "Exp_Mean": round(e_mean, 4),
+        "Sim_Mean": round(s_mean, 4),
+        "Abs_Mean_Diff": round(abs(s_mean - e_mean), 4),
+        "Exp_Median": round(e_med, 4),
+        "Sim_Median": round(s_med, 4),
+        "Abs_Median_Diff": round(abs(s_med - e_med), 4),
+        "Exp_Std": round(e_std, 4),
+        "Sim_Std": round(s_std, 4),
+        "Abs_Std_Diff": round(abs(s_std - e_std), 4),
+        "Wasserstein": round(w_dist, 4),
+        "KS_Stat": round(ks_stat, 4),
+    }
+
+
+def plot_14_feature_raw_comparison(exp_df, sim_df, exp_name, sim_name, param_label, output_path):
+    n_features = len(KINEMATIC_COLUMNS)
+    ncols = 3
+    nrows = int(np.ceil(n_features / ncols))
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(18, 4.8 * nrows), dpi=150)
+    axes = np.asarray(axes).flatten()
+
+    for i, feature in enumerate(KINEMATIC_COLUMNS):
+        ax = axes[i]
+        unit = FEATURE_UNITS[feature]
+
+        exp_raw = clean_feature_array(exp_df, feature)
+        sim_raw = clean_feature_array(sim_df, feature)
+
+        if len(exp_raw) == 0 or len(sim_raw) == 0:
+            ax.set_title(f"{feature}\n(no valid data)")
+            ax.axis("off")
+            continue
+
+        combined = np.concatenate([exp_raw, sim_raw])
+        min_v, max_v = np.percentile(combined, [0.05, 99.95])
+
+        ax.hist(
+            exp_raw,
+            bins=60,
+            range=(min_v, max_v) if min_v < max_v else None,
+            density=True,
+            alpha=0.55,
+            color="blue",
+            label="Experimental"
+        )
+        ax.hist(
+            sim_raw,
+            bins=60,
+            range=(min_v, max_v) if min_v < max_v else None,
+            density=True,
+            alpha=0.55,
+            color="red",
+            label="Simulation"
+        )
+
+        ax.set_title(feature, fontsize=11, fontweight="bold")
+        ax.set_xlabel(f"Value ({unit})" if unit != "dimensionless" else "Value (dimensionless)", fontsize=9.5)
+        ax.set_ylabel("Probability Density", fontsize=9.5)
+        ax.grid(alpha=0.2)
+
+        if i == 0:
+            ax.legend(frameon=True, facecolor="white", framealpha=0.9)
+
+    for j in range(n_features, len(axes)):
+        axes[j].axis("off")
+
+    fig.suptitle(
+        f"{exp_name} vs {sim_name}\n"
+        f"Kinematic Distribution Comparison (Raw Physical Units) [{param_label}]",
+        fontsize=17,
+        fontweight="bold"
+    )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+def plot_four_regime_raw_summary(regime_data_map, param_label, output_path):
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12), dpi=150)
+    panels = [
+        ("Killing Cancer", axes[0, 0]),
+        ("Killing T-Cell", axes[0, 1]),
+        ("Non-Killing Cancer", axes[1, 0]),
+        ("Non-Killing T-Cell", axes[1, 1]),
+    ]
+
+    for regime_name, ax in panels:
+        exp_df, sim_df = regime_data_map[regime_name]
+        
+        key_feat = "DX_FROM_ORIGIN"  # Using displacement from origin as a representative feature for summary
+        exp_v = clean_feature_array(exp_df, key_feat)
+        sim_v = clean_feature_array(sim_df, key_feat)
+
+        if len(exp_v) > 0 and len(sim_v) > 0:
+            combined = np.concatenate([exp_v, sim_v])
+            min_v, max_v = np.percentile(combined, [0.05, 99.95])
+
+            ax.hist(exp_v, bins=50, range=(min_v, max_v) if min_v < max_v else None,
+                    density=True, alpha=0.55, color="blue", label="Experimental")
+            ax.hist(sim_v, bins=50, range=(min_v, max_v) if min_v < max_v else None,
+                    density=True, alpha=0.55, color="red", label="Simulation")
+            
+            ax.set_title(f"{regime_name} — Raw DISPLACEMENT from X[0] (µm)", fontsize=12, fontweight="bold")
+            ax.set_xlabel("DISPLACEMENT from X[0](µm)")
+            ax.set_ylabel("Probability Density")
+            ax.grid(alpha=0.2)
+            ax.legend(frameon=True)
+        else:
+            ax.set_title(f"{regime_name} (no valid data)")
+
+    fig.suptitle(
+        f"4-Regime Representative Overview (Raw Physical Units) [{param_label}]\n"
+        "(Refer to individual 14-feature figures for complete breakdown)",
+        fontsize=16,
+        fontweight="bold"
+    )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+# =============================================================================
+# 5. PARAMETER TUNING MAIN PIPELINE
+# =============================================================================
+def format_param_string(param_name, param_val):
+    if isinstance(param_val, tuple):
+        val_str = f"{param_val[0]}_{param_val[1]}"
+        label_str = f"{param_name} = {param_val[0]} – {param_val[1]}"
+    else:
+        val_str = f"{param_val}"
+        label_str = f"{param_name} = {param_val}"
+    folder_name = f"{param_name}_{val_str}"
+    return folder_name, label_str
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Cell Kinematics Parameter Tuning Pipeline (Raw Physical Units)")
+    parser.add_argument("--parameter", type=str, default=TUNING_PARAMETER, help="Simulator parameter to tune")
+    args = parser.parse_args()
+
+    param_to_tune = args.parameter
+    values_to_sweep = TUNING_VALUES
+    total_iters = len(values_to_sweep)
+
+    param_base_dir = os.path.join(BASE_OUTPUT_DIR, param_to_tune)
+    os.makedirs(param_base_dir, exist_ok=True)
+
+    print("\n" + "=" * 70)
+    print("      CELL KINEMATICS PARAMETER TUNING & VISUAL SWEEP PIPELINE       ")
+    print("                      (STRICT RAW PHYSICAL UNITS)                    ")
+    print("=" * 70)
+    print(f"Parameter to Tune : {param_to_tune}")
+    print(f"Total Iterations  : {total_iters}")
+    print(f"Hardware Device   : {DEVICE}")
+    print(f"Output Directory  : {os.path.abspath(param_base_dir)}")
+    print("=" * 70 + "\n")
+
+    # Step 1: Pre-load all 4 Experimental Datasets ONCE
+    print("--- PRE-LOADING EXPERIMENTAL DATASETS (CACHED) ---")
+    exp_datasets = {
+        "Killing Cancer": load_dataset_cached(EXPERIMENTAL_KILLING_CANCER, "Experimental Killing Cancer"),
+        "Killing T-Cell": load_dataset_cached(EXPERIMENTAL_KILLING_TCELL, "Experimental Killing T-Cell"),
+        "Non-Killing Cancer": load_dataset_cached(EXPERIMENTAL_NONKILLING_CANCER, "Experimental Non-Killing Cancer"),
+        "Non-Killing T-Cell": load_dataset_cached(EXPERIMENTAL_NONKILLING_TCELL, "Experimental Non-Killing T-Cell"),
+    }
+    print("Experimental datasets loaded and cached in memory.\n")
+
+    # Step 2: Parameter Sweep Execution Loop
+    for idx, param_val in enumerate(values_to_sweep, start=1):
+        folder_name, label_str = format_param_string(param_to_tune, param_val)
+        iter_output_dir = os.path.join(param_base_dir, folder_name)
+        os.makedirs(iter_output_dir, exist_ok=True)
+
+        print("=" * 70)
+        print(f"ITERATION {idx} / {total_iters}")
+        print(f"Setting: {label_str}")
+        print(f"Destination: {iter_output_dir}")
+        print("=" * 70)
+
+        # 2A: Configure and Run Simulator
+        print("Running Simulator for Killing Regime...")
+        sim_kill = CellSimulation(
+            num_immune=100, num_cancer=100,
+            mode='killing', seed=RANDOM_SEED,
+            param_override={param_to_tune: param_val}
+        )
+        sim_kill.run_simulation()
+        tcell_kill_csv, cancer_kill_csv = sim_kill.export_kinematics_csv(iter_output_dir)
+
+        print("Running Simulator for Non-Killing Regime...")
+        sim_nonkill = CellSimulation(
+            num_immune=100, num_cancer=100,
+            mode='non-killing', seed=RANDOM_SEED,
+            param_override={param_to_tune: param_val}
+        )
+        sim_nonkill.run_simulation()
+        tcell_nonkill_csv, cancer_nonkill_csv = sim_nonkill.export_kinematics_csv(iter_output_dir)
+
+        # 2B: Load Simulation Outputs (Filtered to FRAME % 6 == 0)
+        print("\nLoading Simulation Outputs...")
+        sim_datasets = {
+            "Killing Cancer": load_dataset_cached(cancer_kill_csv, "Sim Killing Cancer", is_simulation=True),
+            "Killing T-Cell": load_dataset_cached(tcell_kill_csv, "Sim Killing T-Cell", is_simulation=True),
+            "Non-Killing Cancer": load_dataset_cached(cancer_nonkill_csv, "Sim Non-Killing Cancer", is_simulation=True),
+            "Non-Killing T-Cell": load_dataset_cached(tcell_nonkill_csv, "Sim Non-Killing T-Cell", is_simulation=True),
+        }
+
+        # 2C: Generate Four 14-Feature Raw Figures & Compute Concise 10-Metric Table
+        print("Generating 14-Feature Histograms & Concise Metrics Table...")
+        regimes = [
+            ("Killing Cancer", "killing_cancer.png"),
+            ("Killing T-Cell", "killing_tcell.png"),
+            ("Non-Killing Cancer", "nonkilling_cancer.png"),
+            ("Non-Killing T-Cell", "nonkilling_tcell.png"),
+        ]
+
+        regime_data_map = {}
+        metrics_rows = []
+
+        for r_name, fig_filename in regimes:
+            e_df = exp_datasets[r_name]
+            s_df = sim_datasets[r_name]
+            regime_data_map[r_name] = (e_df, s_df)
+
+            fig_path = os.path.join(iter_output_dir, fig_filename)
+            plot_14_feature_raw_comparison(
+                e_df, s_df,
+                f"Experimental {r_name}", f"Simulated {r_name}",
+                label_str, fig_path
+            )
+
+            # Calculate raw metrics for all 14 features
+            for feat in KINEMATIC_COLUMNS:
+                e_arr = clean_feature_array(e_df, feat)
+                s_arr = clean_feature_array(s_df, feat)
+                res = compute_raw_feature_metrics(e_arr, s_arr, feat, r_name)
+                if res:
+                    metrics_rows.append(res)
+
+        # Export concise metrics CSV
+        metrics_df = pd.DataFrame(metrics_rows)
+        csv_metrics_path = os.path.join(iter_output_dir, "raw_metrics_summary.csv")
+        metrics_df.to_csv(csv_metrics_path, index=False)
+        print(f"Concise metrics table saved: {csv_metrics_path}")
+
+        # 2D: Generate 4-Regime Raw Summary Overview
+        summary_fig_path = os.path.join(iter_output_dir, "00_all_regimes_summary_overview.png")
+        plot_four_regime_raw_summary(regime_data_map, label_str, summary_fig_path)
+
+        print(f"Completed Iteration {idx} / {total_iters}")
+        print(f"All outputs saved to:\n  {iter_output_dir}\n")
+
+    print("\n" + "=" * 70)
+    print("                    PARAMETER SWEEP COMPLETE                         ")
+    print("=" * 70)
+    print(f"Parameter Tuned : {param_to_tune}")
+    print(f"Total Runs      : {total_iters}")
+    print(f"Master Directory: {os.path.abspath(param_base_dir)}")
+    print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":
-    print(f"Using execution hardware device: {DEVICE}")
-    print("Generating full-frame continuous kinematic simulation datasets...")
-    sim_obj, _, _ = generate_dataset('killing', 0)
-    generate_dataset('non-killing', 0)
-    
-    # ============================================================
-    # VALIDATION CHECKS (Consecutive-Frame Kinematic Proof)
-    # ============================================================
-    print("\n============================================================")
-    print("      CONSECUTIVE-FRAME KINEMATIC STEP VERIFICATION         ")
-    print("============================================================")
-    df_val = pd.read_csv("new_simulator/kinematic_csv_outputs/killing_T-cell_kinematics.csv")
-    c1 = df_val[df_val['TRACK_ID'] == 1].sort_values('FRAME').set_index('FRAME')
-    
-    print("\n[VERIFICATION A: Frame 5 -> Frame 6 Step Transition]")
-    x5, y5 = c1.loc[5, 'POSITION_X'], c1.loc[5, 'POSITION_Y']
-    x6, y6 = c1.loc[6, 'POSITION_X'], c1.loc[6, 'POSITION_Y']
-    calc_dx6 = x6 - x5
-    calc_dy6 = y6 - y5
-    calc_disp6 = math.sqrt(calc_dx6**2 + calc_dy6**2)
-    calc_vx6 = calc_dx6 / 1.0
-    calc_vy6 = calc_dy6 / 1.0
-    calc_spd6 = calc_disp6 / 1.0
-
-    print(f" • Pos(Frame 5)        : ({x5:.4f}, {y5:.4f})")
-    print(f" • Pos(Frame 6)        : ({x6:.4f}, {y6:.4f})")
-    print(f" • DX_FROM_PREV(Rec)   : {c1.loc[6, 'DX_FROM_PREVIOUS_POINT']:.4f} | Calc (X6-X5): {calc_dx6:.4f}")
-    print(f" • VEL_X(Rec)          : {c1.loc[6, 'VEL_X']:.4f} | Calc (DX/dt): {calc_vx6:.4f}")
-    print(f" • SPEED(Rec)          : {c1.loc[6, 'SPEED']:.4f} | Calc (Disp/dt): {calc_spd6:.4f}")
-
-    print("\n[VERIFICATION B: Frame 11 -> Frame 12 Step Transition]")
-    x11, y11 = c1.loc[11, 'POSITION_X'], c1.loc[11, 'POSITION_Y']
-    x12, y12 = c1.loc[12, 'POSITION_X'], c1.loc[12, 'POSITION_Y']
-    calc_dx12 = x12 - x11
-    calc_vx12 = calc_dx12 / 1.0
-    print(f" • Pos(Frame 11)       : ({x11:.4f}, {y11:.4f})")
-    print(f" • Pos(Frame 12)       : ({x12:.4f}, {y12:.4f})")
-    print(f" • DX_FROM_PREV(Rec)   : {c1.loc[12, 'DX_FROM_PREVIOUS_POINT']:.4f} | Calc (X12-X11): {calc_dx12:.4f}")
-    print(f" • VEL_X(Rec)          : {c1.loc[12, 'VEL_X']:.4f} | Calc (DX/dt): {calc_vx12:.4f}")
-    print("ALL SIMULATOR KINEMATIC STEP CHECKS PASSED SUCCESSFULLY!")
+    main()

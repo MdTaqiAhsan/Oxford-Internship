@@ -1,14 +1,21 @@
-import pandas as pd
 import os
+import sys
+import pandas as pd
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION & THRESHOLDS
 # ============================================================
+
+# Minimum trajectory duration thresholds (in raw DT_ACC units, i.e., frames)
+CANCER_MIN_DT_ACC = 90    # ~15 minutes (90 frames)
+IMMUNE_MIN_DT_ACC = 360   # ~1 hour (360 frames)
+
+# Primary Track Identifier
+TRACK_ID_COLUMN = "TRACK_ID_TA"
 
 # ------------------------------------------------------------
 # INPUT DATASETS
 # ------------------------------------------------------------
-
 CYTO_T_CELL_INPUT = "cyto_2023_11_21_tcell_04.csv"
 CYTO_CANCER_CELL_INPUT = "cyto_2023_11_21_ccell_04.csv"
 
@@ -18,7 +25,6 @@ WT_CANCER_CELL_INPUT = "wt_2023_11_18_ccell_04.csv"
 # ------------------------------------------------------------
 # OUTPUT DATASETS
 # ------------------------------------------------------------
-
 CYTO_T_CELL_OUTPUT = "Cyto_T-Cell Kinematics.csv"
 CYTO_CANCER_CELL_OUTPUT = "Cyto_Cancer Cell Kinematics.csv"
 
@@ -26,40 +32,14 @@ WT_T_CELL_OUTPUT = "Wt_T-Cell Kinematics.csv"
 WT_CANCER_CELL_OUTPUT = "Wt_Cancer Cell Kinematics.csv"
 
 # ------------------------------------------------------------
-# PROCESSING CONFIGURATION
+# PROCESSING & CONVERSION PARAMETERS
 # ------------------------------------------------------------
-
 CHUNK_SIZE = 100_000
 
-# ------------------------------------------------------------
-# UNIT CONVERSION
-# ------------------------------------------------------------
-
-# Spatial measurements:
-#   pixel -> micrometre
-#
-# Assumption:
-#   1 pixel = 1.6 micrometres
-
+# 1 pixel = 1.6 micrometres
 PIXEL_TO_MICROMETER = 1.6
 
-# Velocity/speed measurements in the experimental files
-# are assumed to be:
-#
-#   pixel/frame
-#
-# One frame interval represents:
-#
-#   10 seconds
-#
-# Therefore:
-#
-#   pixel/frame
-#       × 1.6 µm/pixel
-#       ÷ 10 seconds/frame
-#       =
-#   µm/second
-#
+# 1 frame interval = 10.0 seconds
 SECONDS_PER_FRAME_INTERVAL = 10.0
 
 
@@ -68,6 +48,7 @@ SECONDS_PER_FRAME_INTERVAL = 10.0
 # ============================================================
 
 KINEMATIC_COLUMNS = [
+    "TRACK_ID_TA",
     "FRAME",
 
     "POSITION_X",
@@ -88,24 +69,12 @@ KINEMATIC_COLUMNS = [
     "VEL_Y",
     "SPEED",
     "AVERAGE_SPEED",
+    "DT_ACC",
+    "DX_ACC",
+    "DY_ACC",
 ]
 
-
-# ============================================================
-# SPATIAL COLUMNS
-# ============================================================
-
-# These quantities are distances.
-#
-# Experimental units:
-#     pixel
-#
-# Output units:
-#     micrometre
-#
-# Conversion:
-#     pixel × 1.6 = micrometre
-
+# Spatial measurements: pixel -> micrometre (× 1.6)
 SPATIAL_COLUMNS = [
     "POSITION_X",
     "POSITION_Y",
@@ -119,29 +88,11 @@ SPATIAL_COLUMNS = [
     "DISPLACEMENT_FROM_ORIGIN",
 
     "DISTANCE_TRAVELED",
+    "DX_ACC",
+    "DY_ACC",
 ]
 
-
-# ============================================================
-# VELOCITY / SPEED COLUMNS
-# ============================================================
-
-# These quantities are assumed to be given as:
-#
-#     pixel/frame
-#
-# We convert them to:
-#
-#     micrometre/second
-#
-# using:
-#
-#     pixel/frame × 1.6 µm/pixel ÷ 10 s/frame
-#
-# Net multiplication:
-#
-#     × 0.16
-
+# Velocity/Speed: pixel/frame -> µm/s (× 1.6 ÷ 10 = × 0.16)
 VELOCITY_COLUMNS = [
     "VEL_X",
     "VEL_Y",
@@ -149,255 +100,166 @@ VELOCITY_COLUMNS = [
     "AVERAGE_SPEED",
 ]
 
+# Time: frames -> seconds (× 10.0)
+TIME_COLUMNS = [
+    "DT_ACC",
+]
+
 
 # ============================================================
-# EXTRACT + CONVERT KINEMATIC DATA
+# TRAJECTORY FILTERING & CONVERSION ENGINE
 # ============================================================
 
-def extract_kinematics(
+def extract_and_filter_kinematics(
     input_file,
     output_file,
+    min_dt_acc_threshold,
+    cell_type_label,
     conversion_factor=PIXEL_TO_MICROMETER,
     seconds_per_frame=SECONDS_PER_FRAME_INTERVAL
 ):
-
-    print("\n" + "=" * 70)
-    print(f"Reading: {input_file}")
+    print("\n" + "=" * 75)
+    print(f"Reading: {input_file} ({cell_type_label})")
     print(f"Output:  {output_file}")
-    print("=" * 70)
-
-    # --------------------------------------------------------
-    # Check input file exists
-    # --------------------------------------------------------
+    print(f"Filter:  Retaining {TRACK_ID_COLUMN} tracks with max(DT_ACC) >= {min_dt_acc_threshold} frames")
+    print("=" * 75)
 
     if not os.path.exists(input_file):
-        raise FileNotFoundError(
-            f"Input file does not exist:\n{input_file}"
-        )
+        raise FileNotFoundError(f"Input file does not exist:\n{input_file}")
 
-    # --------------------------------------------------------
-    # Check required columns
-    # --------------------------------------------------------
-
-    header = pd.read_csv(
-        input_file,
-        nrows=0
-    )
-
-    missing = [
-        col
-        for col in KINEMATIC_COLUMNS
-        if col not in header.columns
-    ]
-
+    # Check header for required columns
+    header = pd.read_csv(input_file, nrows=0)
+    missing = [col for col in KINEMATIC_COLUMNS if col not in header.columns]
     if missing:
         raise ValueError(
-            f"\nMissing columns in {input_file}:\n"
-            + "\n".join(missing)
+            f"\nMissing columns in {input_file}:\n" + "\n".join(missing)
         )
 
-    print(
-        f"All {len(KINEMATIC_COLUMNS)} required "
-        "kinematic/frame columns found."
-    )
+    # ------------------------------------------------------------
+    # PASS 1: Calculate max(DT_ACC) per TRACK_ID_TA (Chunked)
+    # ------------------------------------------------------------
+    print("\n[Pass 1/2] Scanning trajectories to determine max(DT_ACC)...")
+    track_max_dt = {}
 
-    # --------------------------------------------------------
-    # Display conversion information
-    # --------------------------------------------------------
+    for chunk in pd.read_csv(input_file, usecols=[TRACK_ID_COLUMN, "DT_ACC"], chunksize=CHUNK_SIZE):
+        chunk["DT_ACC"] = pd.to_numeric(chunk["DT_ACC"], errors="coerce")
+        grouped = chunk.groupby(TRACK_ID_COLUMN)["DT_ACC"].max()
 
-    print("\nUnit conversions:")
+        for track_id, max_val in grouped.items():
+            if pd.notnull(max_val):
+                if track_id not in track_max_dt:
+                    track_max_dt[track_id] = max_val
+                else:
+                    track_max_dt[track_id] = max(track_max_dt[track_id], max_val)
 
-    print(
-        f"  Spatial quantities: "
-        f"pixel -> micrometre (× {conversion_factor})"
-    )
+    # Set of tracks that meet or exceed the duration threshold
+    qualifying_tracks = {
+        track_id for track_id, max_dt in track_max_dt.items() 
+        if max_dt >= min_dt_acc_threshold
+    }
 
-    print(
-        f"  Velocity/speed quantities: "
-        f"pixel/frame -> micrometre/second "
-        f"(× {conversion_factor} ÷ {seconds_per_frame})"
-    )
+    total_tracks = len(track_max_dt)
+    retained_tracks = len(qualifying_tracks)
+    excluded_tracks = total_tracks - retained_tracks
 
-    net_velocity_factor = (
-        conversion_factor / seconds_per_frame
-    )
+    print(f"Total Unique Tracks Scanned:    {total_tracks:,}")
+    print(f"Tracks Excluded (duration < {min_dt_acc_threshold}): {excluded_tracks:,}")
+    print(f"Tracks Retained (max DT >= {min_dt_acc_threshold}):  {retained_tracks:,} ({(retained_tracks/total_tracks*100):.2f}%)")
 
-    print(
-        f"  Net velocity/speed factor: "
-        f"× {net_velocity_factor}"
-    )
-
-    print("\nSpatial columns converted:")
-    for col in SPATIAL_COLUMNS:
-        print(f"  {col}")
-
-    print("\nVelocity/speed columns converted:")
-    for col in VELOCITY_COLUMNS:
-        print(f"  {col}")
-
-    print("\nUnchanged columns:")
-    print("  FRAME")
-    print("  PATH_EFFICIENCY")
-
-    # --------------------------------------------------------
-    # Process CSV in chunks
-    # --------------------------------------------------------
-
+    # ------------------------------------------------------------
+    # PASS 2: Filter and Convert Qualifying Trajectories
+    # ------------------------------------------------------------
+    print("\n[Pass 2/2] Filtering and applying physical unit conversions...")
     first_chunk = True
-    total_rows = 0
+    total_retained_rows = 0
 
-    for chunk in pd.read_csv(
-        input_file,
-        usecols=KINEMATIC_COLUMNS,
-        chunksize=CHUNK_SIZE
-    ):
+    for chunk in pd.read_csv(input_file, usecols=KINEMATIC_COLUMNS, chunksize=CHUNK_SIZE):
+        # Keep entire trajectories of qualifying tracks only
+        filtered_chunk = chunk[chunk[TRACK_ID_COLUMN].isin(qualifying_tracks)].copy()
 
-        # ----------------------------------------------------
-        # Convert spatial quantities
-        #
-        # pixel -> micrometre
-        # ----------------------------------------------------
+        if len(filtered_chunk) == 0:
+            continue
 
+        # 1. Convert spatial quantities: pixel -> micrometre (× 1.6)
         for col in SPATIAL_COLUMNS:
-
-            chunk[col] = pd.to_numeric(
-                chunk[col],
-                errors="coerce"
+            filtered_chunk[col] = (
+                pd.to_numeric(filtered_chunk[col], errors="coerce") * conversion_factor
             )
 
-            chunk[col] = (
-                chunk[col]
-                * conversion_factor
-            )
-
-        # ----------------------------------------------------
-        # Convert velocity/speed quantities
-        #
-        # pixel/frame -> micrometre/second
-        #
-        # pixel/frame × 1.6 ÷ 10
-        # ----------------------------------------------------
-
+        # 2. Convert velocity/speed: pixel/frame -> µm/s (× 1.6 ÷ 10 = × 0.16)
         for col in VELOCITY_COLUMNS:
-
-            chunk[col] = pd.to_numeric(
-                chunk[col],
-                errors="coerce"
-            )
-
-            chunk[col] = (
-                chunk[col]
+            filtered_chunk[col] = (
+                pd.to_numeric(filtered_chunk[col], errors="coerce")
                 * conversion_factor
                 / seconds_per_frame
             )
 
-        # ----------------------------------------------------
-        # Write converted chunk
-        # ----------------------------------------------------
+        # 3. Convert accumulated tracking time: frames -> seconds (× 10.0)
+        for col in TIME_COLUMNS:
+            filtered_chunk[col] = (
+                pd.to_numeric(filtered_chunk[col], errors="coerce")
+                * seconds_per_frame
+            )
 
-        chunk.to_csv(
+        # Write to final CSV
+        filtered_chunk.to_csv(
             output_file,
             mode="w" if first_chunk else "a",
             header=first_chunk,
             index=False
         )
 
-        total_rows += len(chunk)
+        total_retained_rows += len(filtered_chunk)
         first_chunk = False
 
-        print(
-            f"\rProcessed {total_rows:,} rows",
-            end=""
-        )
+        print(f"\rProcessed and wrote {total_retained_rows:,} qualifying rows", end="")
 
     print(f"\n\nFinished: {output_file}")
-    print(f"Total rows: {total_rows:,}")
+    print(f"Total rows retained for analysis: {total_retained_rows:,}")
 
 
 # ============================================================
-# MAIN
+# MAIN EXECUTION
 # ============================================================
 
 if __name__ == "__main__":
 
-    # --------------------------------------------------------
-    # 1. CYTO / KILLING T-CELL
-    # --------------------------------------------------------
-
-    extract_kinematics(
+    # 1. CYTO / KILLING T-CELL (Threshold >= 360 frames)
+    extract_and_filter_kinematics(
         CYTO_T_CELL_INPUT,
-        CYTO_T_CELL_OUTPUT
+        CYTO_T_CELL_OUTPUT,
+        min_dt_acc_threshold=IMMUNE_MIN_DT_ACC,
+        cell_type_label="Immune / T-Cell"
     )
 
-    # --------------------------------------------------------
-    # 2. CYTO / KILLING CANCER
-    # --------------------------------------------------------
-
-    extract_kinematics(
+    # 2. CYTO / KILLING CANCER (Threshold >= 90 frames)
+    extract_and_filter_kinematics(
         CYTO_CANCER_CELL_INPUT,
-        CYTO_CANCER_CELL_OUTPUT
+        CYTO_CANCER_CELL_OUTPUT,
+        min_dt_acc_threshold=CANCER_MIN_DT_ACC,
+        cell_type_label="Cancer Cell"
     )
 
-    # --------------------------------------------------------
-    # 3. WT / NON-KILLING T-CELL
-    # --------------------------------------------------------
-
-    extract_kinematics(
+    # 3. WT / NON-KILLING T-CELL (Threshold >= 360 frames)
+    extract_and_filter_kinematics(
         WT_T_CELL_INPUT,
-        WT_T_CELL_OUTPUT
+        WT_T_CELL_OUTPUT,
+        min_dt_acc_threshold=IMMUNE_MIN_DT_ACC,
+        cell_type_label="Immune / T-Cell"
     )
 
-    # --------------------------------------------------------
-    # 4. WT / NON-KILLING CANCER
-    # --------------------------------------------------------
-
-    extract_kinematics(
+    # 4. WT / NON-KILLING CANCER (Threshold >= 90 frames)
+    extract_and_filter_kinematics(
         WT_CANCER_CELL_INPUT,
-        WT_CANCER_CELL_OUTPUT
+        WT_CANCER_CELL_OUTPUT,
+        min_dt_acc_threshold=CANCER_MIN_DT_ACC,
+        cell_type_label="Cancer Cell"
     )
 
-    # ========================================================
-    # COMPLETE
-    # ========================================================
-
-    print("\n" + "=" * 70)
-    print("KINEMATIC EXTRACTION + UNIT CONVERSION COMPLETE")
-    print("=" * 70)
-
-    print("\nCreated datasets:")
-
-    print(f"  1. {CYTO_T_CELL_OUTPUT}")
-    print(f"  2. {CYTO_CANCER_CELL_OUTPUT}")
-    print(f"  3. {WT_T_CELL_OUTPUT}")
-    print(f"  4. {WT_CANCER_CELL_OUTPUT}")
-
-    print("\nUnit conversion applied:")
-
-    print(
-        "  Distance:       pixel -> micrometre       × 1.6"
-    )
-
-    print(
-        "  Velocity X:     pixel/frame -> µm/second  × 1.6 / 10"
-    )
-
-    print(
-        "  Velocity Y:     pixel/frame -> µm/second  × 1.6 / 10"
-    )
-
-    print(
-        "  Speed:          pixel/frame -> µm/second  × 1.6 / 10"
-    )
-
-    print(
-        "  Average speed:  pixel/frame -> µm/second  × 1.6 / 10"
-    )
-
-    print("\nNet velocity/speed conversion:")
-    print("  × 0.16")
-
-    print("\nNot converted:")
-    print("  FRAME")
-    print("  PATH_EFFICIENCY")
-
-    print("=" * 70)
+    print("\n" + "=" * 75)
+    print("KINEMATIC EXTRACTION & TRAJECTORY-DURATION FILTERING COMPLETE")
+    print("=" * 75)
+    print("All generated datasets strictly retain complete trajectories where:")
+    print(f"  - Cancer Cells:   max(DT_ACC) >= {CANCER_MIN_DT_ACC} frames (~15 min)")
+    print(f"  - Immune T-Cells: max(DT_ACC) >= {IMMUNE_MIN_DT_ACC} frames (~1 hour)")
+    print("=" * 75)

@@ -1,0 +1,20 @@
+{
+    "timesteps": 8635,
+    "density_fraction": 0.5,
+    "population_frame_max": 1800,
+    "staggered_tracks": true,
+    "regimes": {
+        "killing": {
+            "parameters_file": "C:\\Users\\taqio\\OneDrive\\Desktop\\CSE\\Oxford Internship\\Oxford-Internship\\results\\tuning\\optimal_parameters_killing_0to5hrs.json",
+            "seed": 42,
+            "num_immune": 676,
+            "num_cancer": 913
+        },
+        "non-killing": {
+            "parameters_file": "C:\\Users\\taqio\\OneDrive\\Desktop\\CSE\\Oxford Internship\\Oxford-Internship\\results\\tuning\\optimal_parameters_non-killing_0to5hrs.json",
+            "seed": 142,
+            "num_immune": 1390,
+            "num_cancer": 698
+        }
+    }
+}

@@ -1,0 +1,56 @@
+{
+    "trials_per_regime": 30,
+    "frame_cutoff": 1800,
+    "observation_stride": 6,
+    "density_fraction": 0.5,
+    "train_seeds": [
+        1001
+    ],
+    "validation_seeds": [
+        3003,
+        4004
+    ],
+    "top_k_validate": 3,
+    "sampler_seed": 42,
+    "feature_weights": {
+        "DX_FROM_PREVIOUS_POINT": 0.1,
+        "DISPLACEMENT_FROM_PREVIOUS_POINT": 0.1,
+        "SPEED": 0.15,
+        "DY_FROM_PREVIOUS_POINT": 0.0,
+        "VEL_X": 0.0,
+        "VEL_Y": 0.0,
+        "DX_FROM_ORIGIN": 0.1,
+        "DISPLACEMENT_FROM_ORIGIN": 0.15,
+        "DY_FROM_ORIGIN": 0.0,
+        "DX_ACC": 0.1,
+        "DISTANCE_TRAVELED": 0.15,
+        "DY_ACC": 0.0,
+        "AVERAGE_SPEED": 0.0,
+        "PATH_EFFICIENCY": 0.15,
+        "POSITION_X": 0.0,
+        "POSITION_Y": 0.0,
+        "DT_ACC": 0.0
+    },
+    "regimes": {
+        "killing": {
+            "selected_trial": 21,
+            "train_loss": 0.1922882317079789,
+            "validation_loss": 0.18836203716818137,
+            "validation_loss_std": 0.0061829849888070665,
+            "population": {
+                "tcell": 676,
+                "cancer": 913
+            }
+        },
+        "non-killing": {
+            "selected_trial": 24,
+            "train_loss": 0.17861375776706634,
+            "validation_loss": 0.1818748363174596,
+            "validation_loss_std": 0.001497324428113983,
+            "population": {
+                "tcell": 1390,
+                "cancer": 698
+            }
+        }
+    }
+}

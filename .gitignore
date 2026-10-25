@@ -1,26 +1,46 @@
-# Python virtual environment
-hopfield_gpu_env/
-
-# Python cache
+# ---------------------------------------------------------------
+# Python environments, caches and third-party clones
+# ---------------------------------------------------------------
+hopfield_gpu_env*/
+hopfield-layers/
 __pycache__/
-*.pyc
+*.py[cod]
+.ipynb_checkpoints/
+.vscode/
 
-# Experimental datasets
-cyto_2023_11_21_tcell_04.csv
-cyto_2023_11_21_ccell_04.csv
+# ---------------------------------------------------------------
+# Datasets (multi-GB, stay on this computer)
+#   raw tracking data:   cyto_*/wt_* *_04.csv
+#   extracted kinematics: Cyto_/Wt_ "... Kinematics.csv"
+# Any CSV in the project root is treated as data.
+# ---------------------------------------------------------------
+/*.csv
 
-# Extracted kinematic datasets
-T-Cell Kinematics.csv
-Cancer Cell Kinematics.csv
+# ---------------------------------------------------------------
+# Pipeline outputs (results/ is created by the scripts)
+#   kept on GitHub: results/tuning/ (optimal parameters, trial logs)
+#                   results/comparisons/ (metrics, report, plots)
+#   ignored: large simulated kinematics, caches and run logs
+# ---------------------------------------------------------------
+results/simulations/**/*.csv
+results/track_windows/
+results/logs/
 
-# Simulation outputs
-new_simulator/new_simulation_data/
-new_simulator/kinematic_csv_outputs/
+# ---------------------------------------------------------------
+# Legacy outputs from before the Oct 2026 cleanup
+# (superseded by results/comparisons/)
+# ---------------------------------------------------------------
+kinematic_comparison_plots/
+kinematic_distribution_metrics/
+kinematic_distribution_metrics_0to5hrs/
+tcell_regime_comparisons/
+old_simulator/new_simulation_data/
+old_simulator/kinematic_csv_outputs/
 
-# NumPy simulation outputs
+# ---------------------------------------------------------------
+# Other generated binaries
+# ---------------------------------------------------------------
 *.npy
 *.npz
-
-# Excel outputs
 *.xlsx
 *.xls

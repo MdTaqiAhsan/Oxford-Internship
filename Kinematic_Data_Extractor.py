@@ -1,6 +1,25 @@
+"""
+Kinematic_Data_Extractor.py
+================================================================================
+Turns the raw tracking exports (cyto_* = killing, wt_* = non-killing) into the
+"<Regime>_<Cell> Kinematics.csv" files used by every other script:
+  - keeps whole tracks lasting >= 1 h (T-cells) / >= 15 min (cancer cells)
+  - converts pixels -> µm, pixel/frame -> µm/s, frames -> seconds
+  - ignores zero-length steps: rows where the cell did not move since the
+    previous frame (DISPLACEMENT_FROM_PREVIOUS_POINT == 0, including the first
+    row of each track) get NaN step features (DX/DY/DISPLACEMENT_FROM_PREVIOUS_POINT,
+    VEL_X, VEL_Y, SPEED). The simulation never produces exactly-zero steps, so
+    these would otherwise form a spike it cannot match. The row's cumulative
+    features (DISTANCE_TRAVELED, DISPLACEMENT_FROM_ORIGIN, ...) are kept.
+Input and output paths come from project_paths.py.
+================================================================================
+"""
+
 import os
-import sys
+import numpy as np
 import pandas as pd
+
+from project_paths import EXPERIMENTAL_DATA, RAW_DATA
 
 # ============================================================
 # CONFIGURATION & THRESHOLDS
@@ -16,20 +35,20 @@ TRACK_ID_COLUMN = "TRACK_ID_TA"
 # ------------------------------------------------------------
 # INPUT DATASETS
 # ------------------------------------------------------------
-CYTO_T_CELL_INPUT = "cyto_2023_11_21_tcell_04.csv"
-CYTO_CANCER_CELL_INPUT = "cyto_2023_11_21_ccell_04.csv"
+CYTO_T_CELL_INPUT = RAW_DATA["killing"]["tcell"]
+CYTO_CANCER_CELL_INPUT = RAW_DATA["killing"]["cancer"]
 
-WT_T_CELL_INPUT = "wt_2023_11_18_tcell_04.csv"
-WT_CANCER_CELL_INPUT = "wt_2023_11_18_ccell_04.csv"
+WT_T_CELL_INPUT = RAW_DATA["non-killing"]["tcell"]
+WT_CANCER_CELL_INPUT = RAW_DATA["non-killing"]["cancer"]
 
 # ------------------------------------------------------------
 # OUTPUT DATASETS
 # ------------------------------------------------------------
-CYTO_T_CELL_OUTPUT = "Cyto_T-Cell Kinematics.csv"
-CYTO_CANCER_CELL_OUTPUT = "Cyto_Cancer Cell Kinematics.csv"
+CYTO_T_CELL_OUTPUT = EXPERIMENTAL_DATA["killing"]["tcell"]
+CYTO_CANCER_CELL_OUTPUT = EXPERIMENTAL_DATA["killing"]["cancer"]
 
-WT_T_CELL_OUTPUT = "Wt_T-Cell Kinematics.csv"
-WT_CANCER_CELL_OUTPUT = "Wt_Cancer Cell Kinematics.csv"
+WT_T_CELL_OUTPUT = EXPERIMENTAL_DATA["non-killing"]["tcell"]
+WT_CANCER_CELL_OUTPUT = EXPERIMENTAL_DATA["non-killing"]["cancer"]
 
 # ------------------------------------------------------------
 # PROCESSING & CONVERSION PARAMETERS
@@ -105,6 +124,16 @@ TIME_COLUMNS = [
     "DT_ACC",
 ]
 
+# Per-step features that are meaningless for a zero-length step (set to NaN)
+STEP_COLUMNS = [
+    "DX_FROM_PREVIOUS_POINT",
+    "DY_FROM_PREVIOUS_POINT",
+    "DISPLACEMENT_FROM_PREVIOUS_POINT",
+    "VEL_X",
+    "VEL_Y",
+    "SPEED",
+]
+
 
 # ============================================================
 # TRAJECTORY FILTERING & CONVERSION ENGINE
@@ -164,14 +193,21 @@ def extract_and_filter_kinematics(
 
     print(f"Total Unique Tracks Scanned:    {total_tracks:,}")
     print(f"Tracks Excluded (duration < {min_dt_acc_threshold}): {excluded_tracks:,}")
-    print(f"Tracks Retained (max DT >= {min_dt_acc_threshold}):  {retained_tracks:,} ({(retained_tracks/total_tracks*100):.2f}%)")
+    retained_pct = (retained_tracks / total_tracks * 100) if total_tracks > 0 else 0.0
+    print(f"Tracks Retained (max DT >= {min_dt_acc_threshold}):  {retained_tracks:,} ({retained_pct:.2f}%)")
 
     # ------------------------------------------------------------
     # PASS 2: Filter and Convert Qualifying Trajectories
     # ------------------------------------------------------------
     print("\n[Pass 2/2] Filtering and applying physical unit conversions...")
+    # Remove any output from a previous run, so a run that retains nothing
+    # cannot leave a stale file behind
+    if os.path.exists(output_file):
+        os.remove(output_file)
+
     first_chunk = True
     total_retained_rows = 0
+    total_zero_steps = 0
 
     for chunk in pd.read_csv(input_file, usecols=KINEMATIC_COLUMNS, chunksize=CHUNK_SIZE):
         # Keep entire trajectories of qualifying tracks only
@@ -201,6 +237,11 @@ def extract_and_filter_kinematics(
                 * seconds_per_frame
             )
 
+        # 4. Ignore zero-length steps (see module docstring)
+        zero_step = filtered_chunk["DISPLACEMENT_FROM_PREVIOUS_POINT"] == 0
+        filtered_chunk.loc[zero_step, STEP_COLUMNS] = np.nan
+        total_zero_steps += int(zero_step.sum())
+
         # Write to final CSV
         filtered_chunk.to_csv(
             output_file,
@@ -216,6 +257,9 @@ def extract_and_filter_kinematics(
 
     print(f"\n\nFinished: {output_file}")
     print(f"Total rows retained for analysis: {total_retained_rows:,}")
+    if total_retained_rows:
+        print(f"Zero-length steps ignored (step features set to NaN): {total_zero_steps:,} "
+              f"({total_zero_steps / total_retained_rows * 100:.1f}% of rows)")
 
 
 # ============================================================
